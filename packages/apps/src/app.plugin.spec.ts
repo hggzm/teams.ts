@@ -2,7 +2,6 @@ import { ConsoleLogger } from '@microsoft/teams.common/logging';
 
 import { App } from './app';
 import { IErrorEvent } from './events';
-import { HttpPlugin } from './plugins';
 import { EmitPluginEvent, IPlugin, IPluginStartEvent } from './types';
 import { Event, Plugin } from './types/plugin/decorators';
 
@@ -10,16 +9,6 @@ interface ITestEvents {
     test: {
         message: string;
         bar: number;
-    }
-}
-
-class TestHttpPlugin extends HttpPlugin {
-    async onStart(_event: IPluginStartEvent) {
-        // No-op for tests
-    }
-
-    async onStop() {
-        // No-op for tests
     }
 }
 
@@ -50,7 +39,7 @@ describe('app.plugin', () => {
         const testPlugin = new TestPlugin();
         const app = new App({
             logger: new ConsoleLogger('test', { level: 'debug' }),
-            plugins: [testPlugin, new TestHttpPlugin()]
+            plugins: [testPlugin]
         });
 
         let receivedEventMessage: string = '';
@@ -61,10 +50,12 @@ describe('app.plugin', () => {
             event.nonExistentProperty = 'bar';
         });
 
-        await app.start();
+        await app.start(3980);
 
         testPlugin.testEmit();
         expect(receivedEventMessage).toEqual('hello');
+
+        await app.stop();
     });
 
     it('should throw error when registering duplicate plugin names', () => {
@@ -110,11 +101,13 @@ describe('app.plugin', () => {
         const eventFn = jest.fn();
         app.event('activity', eventFn);
 
-        await app.start();
+        await app.start(3981);
         const plugin = app.getPlugin('reservedPlugin') as ReservedEventPlugin;
 
         plugin.testEmit();
         expect(eventFn).not.toHaveBeenCalled();
+
+        await app.stop();
     });
 
     it('should call plugin lifecycle methods in correct order', async () => {
@@ -142,10 +135,10 @@ describe('app.plugin', () => {
 
         const app = new App({
             logger: new ConsoleLogger('test', { level: 'debug' }),
-            plugins: [new LifecyclePlugin(), new TestHttpPlugin()]
+            plugins: [new LifecyclePlugin()]
         });
 
-        await app.start();
+        await app.start(3982);
         await app.stop();
 
         expect(lifecycleOrder).toEqual(['onInit', 'onStart', 'onStop']);
@@ -165,7 +158,7 @@ describe('app.plugin', () => {
 
         const app = new App({
             logger: new ConsoleLogger('test', { level: 'debug' }),
-            plugins: [new ErrorPlugin(), new TestHttpPlugin()]
+            plugins: [new ErrorPlugin()]
         });
 
         let errorReceived = null as Error | null;
@@ -173,9 +166,11 @@ describe('app.plugin', () => {
             errorReceived = event.error;
         });
 
-        await app.start();
+        await app.start(3983);
 
         expect(errorReceived).toBeDefined();
         expect(errorReceived?.message).toBe('test error');
+
+        await app.stop();
     });
 });
