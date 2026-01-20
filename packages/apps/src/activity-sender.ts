@@ -2,7 +2,7 @@ import { ActivityParams, Client, ConversationReference, SentActivity } from '@mi
 import * as $http from '@microsoft/teams.common/http';
 import { ILogger } from '@microsoft/teams.common/logging';
 
-import { HttpStream } from './http-stream';
+import { HttpStream } from './http/http-stream';
 import { IStreamer } from './types';
 
 /**
