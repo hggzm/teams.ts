@@ -1,4 +1,7 @@
-import { Client, ClientOptions } from '@microsoft/teams.common/http';
+import {
+  Client as HttpClient,
+  type ClientOptions as HttpClientOptions
+} from '@microsoft/teams.common';
 
 import { ChannelInfo, TeamDetails } from '../models';
 
@@ -13,18 +16,18 @@ export class TeamClient {
   set http(v) {
     this._http = v;
   }
-  protected _http: Client;
+  protected _http: HttpClient;
   protected _apiClientSettings: Partial<ApiClientSettings>;
 
-  constructor(serviceUrl: string, options?: Client | ClientOptions, apiClientSettings?: Partial<ApiClientSettings>) {
+  constructor(serviceUrl: string, options?: HttpClient | HttpClientOptions, apiClientSettings?: Partial<ApiClientSettings>) {
     this.serviceUrl = serviceUrl;
 
     if (!options) {
-      this._http = new Client();
+      this._http = new HttpClient();
     } else if ('request' in options) {
       this._http = options;
     } else {
-      this._http = new Client(options);
+      this._http = new HttpClient(options);
     }
 
     this._apiClientSettings = mergeApiClientSettings(apiClientSettings);
@@ -36,9 +39,9 @@ export class TeamClient {
   }
 
   async getConversations(id: string) {
-    const res = await this.http.get<ChannelInfo[]>(
+    const res = await this.http.get<{ conversations: ChannelInfo[] }>(
       `${this.serviceUrl}/v3/teams/${id}/conversations`
     );
-    return res.data;
+    return res.data.conversations;
   }
 }

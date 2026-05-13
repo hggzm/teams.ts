@@ -5,9 +5,22 @@ export type Account<P = any> = {
   readonly id: string;
   readonly aadObjectId?: string;
   readonly role: Role;
+  /**
+   * The type of the account. Possible values: 'person', 'bot', 'channel', 'team', 'tag'.
+   * Primarily present on mention entities for non-person accounts. Absent for regular person accounts.
+   */
+  readonly type?: string;
   readonly name: string;
   readonly properties?: P;
   readonly membershipSources?: MembershipSource[];
+
+  /**
+   * Indicates if this account is the target of a targeted message.
+   *
+   * @experimental This API is in preview and may change in the future.
+   * Diagnostic: ExperimentalTeamsTargeted
+   */
+  isTargeted?: boolean;
 };
 
 /**
@@ -27,14 +40,14 @@ export type TeamsChannelAccount<P = any> = {
   readonly name: string;
 
   /**
-   * @member {string} [objectId] The user's Object ID in Azure Active Directory (AAD).
+   * @member {string} [aadObjectId] The user's Object ID in Azure Active Directory (AAD).
    */
-  readonly objectId?: string;
+  readonly aadObjectId?: string;
 
   /**
-   * @member {Role} [userRole] Role of the user (e.g., 'user' or 'bot').
+   * @member {string} [userRole] Role of the user in the conversation.
    */
-  readonly userRole: Role;
+  readonly userRole?: string;
 
   /**
    * @member {string} [givenName] Given name (first name) of the user.
@@ -66,6 +79,22 @@ export type TeamsChannelAccount<P = any> = {
    */
   readonly properties?: P;
 };
+
+/**
+ * The backend inconsistently populates either `objectId` or `aadObjectId` depending on the endpoint:
+ * - `GET /v3/conversations/{id}/members` (non-paginated) → `objectId`
+ * - `GET /v3/conversations/{id}/members/{memberId}`       → `aadObjectId`
+ * - `GET /v3/conversations/{id}/pagedMembers`             → `aadObjectId`
+ * - `GET /v3/conversations/{id}/activities/{id}/members`  → `objectId`
+ *
+ * This function normalizes both into `aadObjectId`.
+ */
+export function resolveAadObjectId(data: any): TeamsChannelAccount {
+  return {
+    ...data,
+    aadObjectId: data.aadObjectId ?? data.objectId,
+  };
+}
 
 export type ConversationAccount = {
   readonly id: string;

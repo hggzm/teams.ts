@@ -1,5 +1,4 @@
 import {
-  AdaptiveCardActionErrorResponse,
   AdaptiveCardActionMessageResponse,
 } from '@microsoft/teams.api';
 import { App } from '@microsoft/teams.apps';
@@ -12,6 +11,7 @@ import {
   IAdaptiveCard,
   NumberInput,
   OpenUrlAction,
+  SubmitData,
   TextBlock,
   TextInput,
   ToggleInput,
@@ -24,7 +24,7 @@ function createBasicCard() {
     new ToggleInput('Notify me').withId('notify'),
     new ActionSet(
       new ExecuteAction({ title: 'Submit' })
-        .withData({ action: 'submit_basic' })
+        .withData(new SubmitData('submit_basic'))
         .withAssociatedInputs('auto')
     )
   );
@@ -61,7 +61,7 @@ function createFormCard() {
       .withValue('blue'),
     new ActionSet(
       new ExecuteAction({ title: 'Submit Form' })
-        .withData({ action: 'submit_form' })
+        .withData(new SubmitData('submit_form'))
         .withAssociatedInputs('auto')
     )
   );
@@ -126,7 +126,7 @@ function createActionCard() {
       .withPlaceholder('Enter your feedback'),
     new ActionSet(
       new ExecuteAction({ title: 'Submit Feedback' })
-        .withData({ action: 'submit_feedback' })
+        .withData(new SubmitData('submit_feedback'))
         .withAssociatedInputs('auto'),
       new OpenUrlAction('https://adaptivecards.microsoft.com').withTitle(
         'Learn More'
@@ -146,7 +146,7 @@ function createActionCardMixed() {
       .withPlaceholder('Enter your feedback'),
     new ActionSet(
       new ExecuteAction({ title: 'Submit Feedback' })
-        .withData({ action: 'submit_feedback' })
+        .withData(new SubmitData('submit_feedback'))
         .withAssociatedInputs('auto'),
       {
         type: 'Action.OpenUrl',
@@ -166,10 +166,7 @@ function editProfileCard() {
       .withValue('false'),
     new ActionSet(
       new ExecuteAction({ title: 'Save' })
-        .withData({
-          action: 'save_profile',
-          entityId: '12345', // This will come back once the user submits
-        })
+        .withData(new SubmitData('save_profile', { entityId: '12345' }))
         .withAssociatedInputs('auto')
     )
   );
@@ -205,9 +202,7 @@ function createProfileCardInputValidation() {
     new TextInput({ id: 'location' }).withLabel('Location'),
     new ActionSet(
       new ExecuteAction({ title: 'Save' })
-        .withData({
-          action: 'save_profile',
-        })
+        .withData(new SubmitData('save_profile'))
         .withAssociatedInputs('auto') // All inputs should be validated
     )
   );
@@ -296,7 +291,7 @@ app.on('message', async ({ send, activity }) => {
       .withValue(new Date().toISOString().split('T')[0]),
     new ActionSet(
       new ExecuteAction({ title: 'Create Task' })
-        .withData({ action: 'create_task' })
+        .withData(new SubmitData('create_task'))
         .withAssociatedInputs('auto')
         .withStyle('positive')
     )
@@ -307,78 +302,55 @@ app.on('message', async ({ send, activity }) => {
   // await send(message);
 });
 
-app.on('card.action', async ({ activity, send }) => {
-  const data = activity.value?.action?.data;
-  if (!data?.action) {
-    return {
-      statusCode: 400,
-      type: 'application/vnd.microsoft.error',
-      value: {
-        code: 'BadRequest',
-        message: 'No action specified',
-        innerHttpError: {
-          statusCode: 400,
-          body: { error: 'No action specified' },
-        },
-      },
-    } satisfies AdaptiveCardActionErrorResponse;
-  }
+// Each card.action handler matches a specific action set by SubmitData
+const OK_RESPONSE: AdaptiveCardActionMessageResponse = {
+  statusCode: 200,
+  type: 'application/vnd.microsoft.activity.message',
+  value: 'Action processed successfully',
+};
 
-  console.debug('Received action data:', data);
+app.on('card.action.submit_basic', async ({ activity, send }) => {
+  const data = activity.value.action.data;
+  await send(`Notification preference set to: ${data.notify}`);
+  return OK_RESPONSE;
+});
 
-  switch (data.action) {
-    case 'submit_basic':
-      await send(`Notification preference set to: ${data.notify}`);
-      break;
+app.on('card.action.submit_form', async ({ activity, send }) => {
+  const data = activity.value.action.data;
+  await send(
+    `Form submitted!\nName: ${data.name}\nComments: ${data.comments}\nColor: ${data.color}`
+  );
+  return OK_RESPONSE;
+});
 
-    case 'submit_form':
-      await send(
-        `Form submitted!\nName: ${data.name}\nComments: ${data.comments}\nColor: ${data.color}`
-      );
-      break;
+app.on('card.action.create_task', async ({ activity, send }) => {
+  const data = activity.value.action.data;
+  await send(
+    `Task created!\nTitle: ${data.title}\nDescription: ${data.description}\nPriority: ${data.priority}\nDue Date: ${data.due_date}`
+  );
+  return OK_RESPONSE;
+});
 
-    case 'create_task':
-      await send(
-        `Task created!\nTitle: ${data.title}\nDescription: ${data.description}\nPriority: ${data.priority}\nDue Date: ${data.due_date}`
-      );
-      break;
+app.on('card.action.submit_feedback', async ({ activity, send }) => {
+  const data = activity.value.action.data;
+  await send(`Feedback received: ${data.feedback}`);
+  return OK_RESPONSE;
+});
 
-    case 'submit_feedback':
-      await send(`Feedback received: ${data.feedback}`);
-      break;
+app.on('card.action.purchase_item', async ({ activity, send }) => {
+  const data = activity.value.action.data;
+  await send(
+    `Purchase request received for game: ${data.choiceGameSingle}`
+  );
+  return OK_RESPONSE;
+});
 
-    case 'purchase_item':
-      await send(
-        `Purchase request received for game: ${data.choiceGameSingle}`
-      );
-      break;
-
-    case 'save_profile':
-      await send(
-        `Profile saved!\nName: ${data.name}\nEmail: ${data.email}\nSubscribed: ${data.subscribe}`
-      );
-      break;
-
-    default:
-      return {
-        statusCode: 400,
-        type: 'application/vnd.microsoft.error',
-        value: {
-          code: 'BadRequest',
-          message: 'Unknown action',
-          innerHttpError: {
-            statusCode: 400,
-            body: { error: 'Unknown action' },
-          },
-        },
-      } satisfies AdaptiveCardActionErrorResponse;
-  }
-
-  return {
-    statusCode: 200,
-    type: 'application/vnd.microsoft.activity.message',
-    value: 'Action processed successfully',
-  } satisfies AdaptiveCardActionMessageResponse;
+app.on('card.action.save_profile', async ({ activity, send }) => {
+  const data = activity.value.action.data;
+  await send(
+    `Profile saved!\nName: ${data.name}\nEmail: ${data.email}\nSubscribed: ${data.subscribe}`
+  );
+  return OK_RESPONSE;
 });
 
 app.start(process.env.PORT || 3978).catch(console.error);

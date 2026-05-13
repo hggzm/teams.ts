@@ -1,9 +1,9 @@
 import jwt from 'jsonwebtoken';
 
-import { JsonWebToken } from '@microsoft/teams.api';
+import { CHINA, JsonWebToken, PUBLIC, US_GOV, US_GOV_DOD, withOverrides } from '@microsoft/teams.api';
 
 import { App } from './app';
-import { TestHttpPlugin } from './plugins/http/plugin.spec';
+import { TestAdapter } from './test-utils';
 
 class TestApp extends App {
   // Expose protected members for testing
@@ -17,6 +17,20 @@ class TestApp extends App {
 
   public async testSend(conversationId: string, activity: any) {
     return this.send(conversationId, activity);
+  }
+
+  public async testReply(conversationId: string, messageId: string, activity: any): Promise<any>;
+  public async testReply(conversationId: string, activity: any): Promise<any>;
+  public async testReply(conversationId: string, messageId: string | any, activity?: any) {
+    if (typeof messageId === 'string' && activity !== undefined) {
+      return this.reply(conversationId, messageId, activity);
+    }
+    return this.reply(conversationId, messageId);
+  }
+
+  // Expose activitySender for mocking (it's protected, so we expose it publicly)
+  public get testActivitySender() {
+    return this.activitySender;
   }
 }
 
@@ -42,11 +56,15 @@ describe('App', () => {
 
     beforeEach(() => {
       app = new TestApp({
+        httpServerAdapter: new TestAdapter(),
         clientId: 'test-client-id',
         clientSecret: 'test-client-secret',
         tenantId: 'test-tenant-id',
-        plugins: [new TestHttpPlugin()],
       });
+    });
+
+    afterEach(async () => {
+      await app.stop();
     });
 
     it('should acquire bot token via TokenManager', async () => {
@@ -83,7 +101,7 @@ describe('App', () => {
 
     it('should return null when credentials are not provided', async () => {
       const appWithoutCreds = new TestApp({
-        plugins: [new TestHttpPlugin()],
+        httpServerAdapter: new TestAdapter()
       });
 
       const botToken = await appWithoutCreds.testGetBotToken();
@@ -110,19 +128,23 @@ describe('App', () => {
   describe('send', () => {
     let app: TestApp;
 
+    afterEach(async () => {
+      await app.stop();
+    });
+
     it('should send message without manifest.name configured', async () => {
       app = new TestApp({
+        httpServerAdapter: new TestAdapter(),
         clientId: 'test-client-id',
         clientSecret: 'test-client-secret',
         tenantId: 'test-tenant-id',
-        plugins: [new TestHttpPlugin()],
       });
 
       await app.start();
 
-      // Mock the http.send method
+      // Mock the activitySender.send method
       const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
-      jest.spyOn(app.http, 'send').mockImplementation(mockSend);
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
 
       await app.testSend('conversation-id', { text: 'Hello' });
 
@@ -134,20 +156,20 @@ describe('App', () => {
 
     it('should send message with manifest.name configured', async () => {
       app = new TestApp({
+        httpServerAdapter: new TestAdapter(),
         clientId: 'test-client-id',
         clientSecret: 'test-client-secret',
         tenantId: 'test-tenant-id',
         manifest: {
           name: { short: 'TestBot', full: 'Test Bot Application' },
         },
-        plugins: [new TestHttpPlugin()],
       });
 
       await app.start();
 
-      // Mock the http.send method
+      // Mock the activitySender.send method
       const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
-      jest.spyOn(app.http, 'send').mockImplementation(mockSend);
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
 
       await app.testSend('conversation-id', { text: 'Hello' });
 
@@ -159,14 +181,304 @@ describe('App', () => {
 
     it('should throw error when app is not started (no clientId)', async () => {
       app = new TestApp({
-        plugins: [new TestHttpPlugin()],
+        httpServerAdapter: new TestAdapter()
       });
 
       await app.start();
 
       await expect(
         app.testSend('conversation-id', { text: 'Hello' })
-      ).rejects.toThrow('app not started');
+      ).rejects.toThrow('App has no credentials set up');
+    });
+  });
+
+  describe('proactive messaging (initialize without start)', () => {
+    let app: TestApp;
+
+    it('should send message after initialize() without start()', async () => {
+      app = new TestApp({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        tenantId: 'test-tenant-id',
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      // Only initialize - no start(), no HTTP server
+      await app.initialize();
+
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testSend('conversation-id', { text: 'Proactive hello' });
+
+      expect(mockSend).toHaveBeenCalled();
+      const [activity, ref] = mockSend.mock.calls[0];
+      expect(activity.text).toBe('Proactive hello');
+      expect(ref.bot.id).toBe('test-client-id');
+      expect(ref.conversation.id).toBe('conversation-id');
+    });
+
+    it('should send adaptive card after initialize() without start()', async () => {
+      app = new TestApp({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        tenantId: 'test-tenant-id',
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      await app.initialize();
+
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testSend('conversation-id', {
+        type: 'message',
+        attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', content: {} }],
+      });
+
+      expect(mockSend).toHaveBeenCalled();
+    });
+
+    it('should not initialize twice', async () => {
+      app = new TestApp({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        tenantId: 'test-tenant-id',
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      await app.initialize();
+      await app.initialize(); // should be a no-op
+
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testSend('conversation-id', { text: 'hello' });
+      expect(mockSend).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('service URL configuration', () => {
+    const originalEnv = process.env.SERVICE_URL;
+
+    afterEach(() => {
+      if (originalEnv === undefined) {
+        delete process.env.SERVICE_URL;
+      } else {
+        process.env.SERVICE_URL = originalEnv;
+      }
+    });
+
+    it('should use default service URL when no configuration provided', () => {
+      delete process.env.SERVICE_URL;
+
+      const app = new App({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      expect(app.api.serviceUrl).toBe('https://smba.trafficmanager.net/teams');
+    });
+
+    it('should use service URL from environment variable', () => {
+      process.env.SERVICE_URL = 'https://custom.service.url/teams';
+
+      const app = new App({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      expect(app.api.serviceUrl).toBe('https://custom.service.url/teams');
+    });
+
+    it('should use service URL from options when provided', () => {
+      process.env.SERVICE_URL = 'https://env.service.url/teams';
+
+      const app = new App({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        serviceUrl: 'https://options.service.url/teams',
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      expect(app.api.serviceUrl).toBe('https://options.service.url/teams');
+    });
+
+    it('should prioritize options > env > default', () => {
+      delete process.env.SERVICE_URL;
+
+      const app1 = new App({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        httpServerAdapter: new TestAdapter(),
+      });
+      expect(app1.api.serviceUrl).toBe('https://smba.trafficmanager.net/teams');
+
+      process.env.SERVICE_URL = 'https://env.service.url/teams';
+      const app2 = new App({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        httpServerAdapter: new TestAdapter(),
+      });
+      expect(app2.api.serviceUrl).toBe('https://env.service.url/teams');
+
+      const app3 = new App({
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        serviceUrl: 'https://options.service.url/teams',
+        httpServerAdapter: new TestAdapter(),
+      });
+      expect(app3.api.serviceUrl).toBe('https://options.service.url/teams');
+    });
+  });
+
+  describe('reply', () => {
+    let app: TestApp;
+
+    beforeEach(async () => {
+      app = new TestApp({
+        httpServerAdapter: new TestAdapter(),
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        tenantId: 'test-tenant-id',
+      });
+      await app.start();
+    });
+
+    afterEach(async () => {
+      await app.stop();
+    });
+
+    it('should construct threaded ID when called with conversationId, messageId, and activity', async () => {
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testReply('19:abc@thread.skype', '1680000000000', { text: 'Hello thread' });
+
+      expect(mockSend).toHaveBeenCalled();
+      const [, ref] = mockSend.mock.calls[0];
+      expect(ref.conversation.id).toBe('19:abc@thread.skype;messageid=1680000000000');
+    });
+
+    it('should pass conversationId as-is when called with two args', async () => {
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testReply('19:abc@thread.skype', { text: 'Hello flat' });
+
+      expect(mockSend).toHaveBeenCalled();
+      const [, ref] = mockSend.mock.calls[0];
+      expect(ref.conversation.id).toBe('19:abc@thread.skype');
+    });
+
+    it('should pass pre-constructed threaded ID as-is when called with two args', async () => {
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testReply('19:abc@thread.skype;messageid=123', { text: 'Hello' });
+
+      expect(mockSend).toHaveBeenCalled();
+      const [, ref] = mockSend.mock.calls[0];
+      expect(ref.conversation.id).toBe('19:abc@thread.skype;messageid=123');
+    });
+
+    it('should construct threaded ID for any conversation type (three-arg form)', async () => {
+      const mockSend = jest.fn().mockResolvedValue({ id: 'activity-id' });
+      jest.spyOn(app.testActivitySender, 'send').mockImplementation(mockSend);
+
+      await app.testReply('19:meeting_abc@thread.v2', '123', { text: 'Hello' });
+
+      expect(mockSend).toHaveBeenCalled();
+      const [, ref] = mockSend.mock.calls[0];
+      expect(ref.conversation.id).toBe('19:meeting_abc@thread.v2;messageid=123');
+    });
+
+    it('should throw on invalid messageId in three-arg form', async () => {
+      await expect(
+        app.testReply('19:abc@thread.skype', 'not-a-number', { text: 'Hello' })
+      ).rejects.toThrow('Invalid messageId');
+    });
+
+    it('should throw when app has no credentials', async () => {
+      const unstartedApp = new TestApp({
+        httpServerAdapter: new TestAdapter(),
+      });
+
+      await expect(
+        unstartedApp.testReply('conv-id', { text: 'Hello' })
+      ).rejects.toThrow('App has no credentials set up');
+    });
+  });
+
+  describe('sovereign cloud Graph routing', () => {
+    const newApp = (cloud?: any) =>
+      new App({
+        httpServerAdapter: new TestAdapter(),
+        clientId: 'test-client-id',
+        clientSecret: 'test-client-secret',
+        tenantId: 'test-tenant-id',
+        cloud,
+      });
+
+    afterEach(async () => {
+      // individual tests await stop themselves
+    });
+
+    it('derives graphBaseUrl from PUBLIC cloud scope', async () => {
+      const app = newApp(PUBLIC);
+      try {
+        expect(app.graphBaseUrl).toBe('https://graph.microsoft.com');
+      } finally {
+        await app.stop();
+      }
+    });
+
+    it('derives graphBaseUrl from US_GOV cloud scope', async () => {
+      const app = newApp(US_GOV);
+      try {
+        expect(app.graphBaseUrl).toBe('https://graph.microsoft.us');
+      } finally {
+        await app.stop();
+      }
+    });
+
+    it('derives graphBaseUrl from US_GOV_DOD cloud scope', async () => {
+      const app = newApp(US_GOV_DOD);
+      try {
+        expect(app.graphBaseUrl).toBe('https://dod-graph.microsoft.us');
+      } finally {
+        await app.stop();
+      }
+    });
+
+    it('derives graphBaseUrl from CHINA cloud scope', async () => {
+      const app = newApp(CHINA);
+      try {
+        expect(app.graphBaseUrl).toBe('https://microsoftgraph.chinacloudapi.cn');
+      } finally {
+        await app.stop();
+      }
+    });
+
+    it('defaults to PUBLIC-derived graphBaseUrl when no cloud is specified', async () => {
+      const app = newApp();
+      try {
+        expect(app.graphBaseUrl).toBe('https://graph.microsoft.com');
+      } finally {
+        await app.stop();
+      }
+    });
+
+    it('leaves graphBaseUrl undefined when graphScope is not a URL', async () => {
+      const customCloud = withOverrides(PUBLIC, { graphScope: 'user.read' });
+      const app = newApp(customCloud);
+      try {
+        expect(app.graphBaseUrl).toBeUndefined();
+      } finally {
+        await app.stop();
+      }
     });
   });
 });

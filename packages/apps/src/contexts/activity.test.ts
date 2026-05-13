@@ -8,16 +8,14 @@ import {
   TokenExchangeResource,
   TokenPostResource,
 } from '@microsoft/teams.api';
-import { ILogger } from '@microsoft/teams.common/logging';
-import { IStorage } from '@microsoft/teams.common/storage';
+import { ILogger, IStorage } from '@microsoft/teams.common';
 
 import { ApiClient, GraphClient } from '../api';
-import { ISender } from '../types';
 
 import { ActivityContext } from './activity';
 
 describe('ActivityContext', () => {
-  let mockSender: ISender;
+  let mockSender: { send: jest.Mock; createStream: jest.Mock };
   let mockApiClient: MockedObject<ApiClient>;
   let mockLogger: ILogger;
   let mockStorage: MockedObject<IStorage>;
@@ -100,7 +98,7 @@ describe('ActivityContext', () => {
   };
 
   const buildActivityContext = (activity: Activity): ActivityContext => {
-    return new ActivityContext(mockSender, {
+    return new ActivityContext({
       appId: 'test-app',
       activity,
       ref: mockRef,
@@ -111,84 +109,137 @@ describe('ActivityContext', () => {
       storage: mockStorage,
       connectionName: 'test-connection',
       next: jest.fn(),
+      activitySender: mockSender,
     });
   };
 
   describe('reply', () => {
-    it('generates blockquote for message activity with short text', async () => {
+    it('stamps quotedReply entity with activity id', async () => {
       const activity = buildIncomingMessageActivity('Hello world');
-
       context = buildActivityContext(activity);
 
       await context.reply('What is up?');
 
       expect(mockSender.send).toHaveBeenCalledTimes(1);
-      expect(mockSender.send).toHaveBeenCalledWith(
-        expect.objectContaining({
-          text: `<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="test-activity-id">
-<strong itemprop="mri" itemid="test-user">Test User</strong><span itemprop="time" itemid="test-activity-id"></span>
-<p itemprop="preview">Hello world</p>
-</blockquote>\r\nWhat is up?`,
-          type: 'message',
-        }),
-        mockRef
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.entities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'quotedReply',
+            quotedReply: { messageId: 'test-activity-id' },
+          }),
+        ])
       );
     });
 
-    it('truncates long messages over 120 characters in blockquote', async () => {
-      const longText = 'A'.repeat(150);
-      const activity = buildIncomingMessageActivity(longText);
-
+    it('prepends placeholder to text', async () => {
+      const activity = buildIncomingMessageActivity('Hello world');
       context = buildActivityContext(activity);
 
       await context.reply('What is up?');
 
-      expect(mockSender.send).toHaveBeenCalledTimes(1);
-      expect(mockSender.send).toHaveBeenCalledWith(
-        expect.objectContaining({
-          text: `<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="test-activity-id">
-<strong itemprop="mri" itemid="test-user">Test User</strong><span itemprop="time" itemid="test-activity-id"></span>
-<p itemprop="preview">${'A'.repeat(120)}...</p>
-</blockquote>\r\nWhat is up?`,
-          type: 'message',
-        }),
-        mockRef
-      );
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.text).toEqual('<quoted messageId="test-activity-id"/> What is up?');
     });
 
-    it('does not add blockquotes for empty quoted messages', async () => {
-      const activity = buildIncomingMessageActivity('');
-
-      context = buildActivityContext(activity);
-
-      await context.reply('What is up?');
-
-      expect(mockSender.send).toHaveBeenCalledTimes(1);
-      expect(mockSender.send).toHaveBeenCalledWith(
-        expect.objectContaining({
-          text: 'What is up?',
-          type: 'message',
-        }),
-        mockRef
-      );
-    });
-
-    it('does not add blockquotes for empty messages', async () => {
-      const activity = buildIncomingMessageActivity('Original Message');
-
+    it('sets placeholder as text when reply text is empty', async () => {
+      const activity = buildIncomingMessageActivity('Hello world');
       context = buildActivityContext(activity);
 
       await context.reply('');
 
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.text).toEqual('<quoted messageId="test-activity-id"/>');
+    });
+
+    it('sets placeholder as text when reply has no text', async () => {
+      const activity = buildIncomingMessageActivity('Hello world');
+      context = buildActivityContext(activity);
+
+      await context.reply({ type: 'message' });
+
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.text).toEqual('<quoted messageId="test-activity-id"/>');
+    });
+
+    it('does not stamp entity when activity has no id', async () => {
+      const activity = buildIncomingMessageActivity('Hello world', '');
+      context = buildActivityContext(activity);
+
+      await context.reply('What is up?');
+
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.entities).toBeUndefined();
+    });
+
+  });
+
+  describe('quote', () => {
+    it('stamps quotedReply entity with given messageId', async () => {
+      const activity = buildIncomingMessageActivity('Hello world');
+      context = buildActivityContext(activity);
+
+      await context.quote('arbitrary-msg-id', 'some text');
+
       expect(mockSender.send).toHaveBeenCalledTimes(1);
-      expect(mockSender.send).toHaveBeenCalledWith(
-        expect.objectContaining({
-          text: '',
-          type: 'message',
-        }),
-        mockRef
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.entities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'quotedReply',
+            quotedReply: { messageId: 'arbitrary-msg-id' },
+          }),
+        ])
       );
     });
+
+    it('prepends placeholder to text', async () => {
+      const activity = buildIncomingMessageActivity('Hello world');
+      context = buildActivityContext(activity);
+
+      await context.quote('msg-42', 'reply text');
+
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.text).toEqual('<quoted messageId="msg-42"/> reply text');
+    });
+
+    it('sets placeholder as text when no text provided', async () => {
+      const activity = buildIncomingMessageActivity('Hello world');
+      context = buildActivityContext(activity);
+
+      await context.quote('msg-42', { type: 'message' });
+
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      expect(sentActivity.text).toEqual('<quoted messageId="msg-42"/>');
+    });
+    
+    it('reply to targeted message strips blockquote via addTargetedMessageInfo', async () => {
+      const activity = new MessageActivity('Hello world')
+        .withFrom({ id: 'test-user', name: 'Test User', role: 'user' })
+        .withRecipient({ id: 'bot-id', name: 'Bot', role: 'bot' }, true)
+        .withChannelId('test-channel')
+        .withConversation({ id: 'test-conversation', conversationType: 'channel', isGroup: false })
+        .withId('test-activity-id');
+
+      context = buildActivityContext(activity);
+
+      await context.reply('Here is your agenda');
+
+      expect(mockSender.send).toHaveBeenCalledTimes(1);
+      const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+      // Reply prepends blockquote, but send() auto-populates addTargetedMessageInfo
+      // which strips quotedReply entities — the blockquote text remains since it's
+      // the legacy format, not the <quoted .../> placeholder.
+      expect(sentActivity.entities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: 'targetedMessageInfo',
+            messageId: 'test-activity-id',
+          }),
+        ])
+      );
+    });
+
   });
 
   describe('send', () => {
@@ -205,6 +256,154 @@ describe('ActivityContext', () => {
         }),
         mockRef
       );
+    });
+
+    describe('targeted messages', () => {
+      it('sends targeted message with recipient from incoming activity', async () => {
+        const activity = buildIncomingMessageActivity('Hello world');
+        context = buildActivityContext(activity);
+
+        const targetedActivity = new MessageActivity('Secret message')
+          .withRecipient({ id: 'test-user', name: 'Test User', role: 'user' }, true);
+
+        await context.send(targetedActivity);
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        expect(mockSender.send).toHaveBeenCalledWith(
+          expect.objectContaining({
+            text: 'Secret message',
+            type: 'message',
+            recipient: expect.objectContaining({ id: 'test-user', name: 'Test User', role: 'user', isTargeted: true }),
+          }),
+          mockRef
+        );
+      });
+
+      it('sends targeted message with explicit recipient id', async () => {
+        const activity = buildIncomingMessageActivity('Hello world');
+        context = buildActivityContext(activity);
+
+        const targetedActivity = new MessageActivity('Secret message')
+          .withRecipient({ id: 'explicit-user-id', name: '', role: 'user' }, true);
+
+        await context.send(targetedActivity);
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        expect(mockSender.send).toHaveBeenCalledWith(
+          expect.objectContaining({
+            text: 'Secret message',
+            type: 'message',
+            recipient: expect.objectContaining({ id: 'explicit-user-id', name: '', role: 'user', isTargeted: true }),
+          }),
+          mockRef
+        );
+      });
+
+      it('does not set recipient for targeted message updates', async () => {
+        const activity = buildIncomingMessageActivity('Hello world');
+        context = buildActivityContext(activity);
+
+        const updateActivity = new MessageActivity('Updated message')
+          .withId('existing-activity-id')
+          .withRecipient({ id: 'user-1', name: '', role: 'user' }, true);
+
+        await context.send(updateActivity);
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+        expect(sentActivity.id).toBe('existing-activity-id');
+        expect(sentActivity.recipient.isTargeted).toBe(true);
+      });
+    });
+
+    describe('prompt preview', () => {
+      it('auto-populates targetedMessageInfo entity when incoming activity is targeted', async () => {
+        const activity = new MessageActivity('Hello world')
+          .withFrom({ id: 'test-user', name: 'Test User', role: 'user' })
+          .withRecipient({ id: 'bot-id', name: 'Bot', role: 'bot' }, true)
+          .withChannelId('test-channel')
+          .withConversation({ id: 'test-conversation', conversationType: 'channel', isGroup: false })
+          .withId('1772129782775');
+
+        context = buildActivityContext(activity);
+
+        await context.send('Here is your agenda');
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        expect(mockSender.send).toHaveBeenCalledWith(
+          expect.objectContaining({
+            text: 'Here is your agenda',
+            type: 'message',
+            entities: expect.arrayContaining([
+              expect.objectContaining({
+                type: 'targetedMessageInfo',
+                messageId: '1772129782775',
+              }),
+            ]),
+          }),
+          mockRef
+        );
+      });
+
+      it('does not auto-populate targetedMessageInfo when incoming activity is not targeted', async () => {
+        const activity = buildIncomingMessageActivity('Hello world');
+        context = buildActivityContext(activity);
+
+        await context.send('Response');
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+        expect(sentActivity.entities).toBeUndefined();
+      });
+
+      it('does not overwrite existing targetedMessageInfo entity', async () => {
+        const activity = new MessageActivity('Hello world')
+          .withFrom({ id: 'test-user', name: 'Test User', role: 'user' })
+          .withRecipient({ id: 'bot-id', name: 'Bot', role: 'bot' }, true)
+          .withChannelId('test-channel')
+          .withConversation({ id: 'test-conversation', conversationType: 'channel', isGroup: false })
+          .withId('1772129782775');
+
+        context = buildActivityContext(activity);
+
+        const outgoing = new MessageActivity('Response')
+          .addTargetedMessageInfo('custom-message-id');
+
+        await context.send(outgoing);
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        const sentActivity = (mockSender.send as jest.Mock).mock.calls[0][0];
+        const targetedEntities = sentActivity.entities.filter((e: any) => e.type === 'targetedMessageInfo');
+        expect(targetedEntities).toHaveLength(1);
+        expect(targetedEntities[0].messageId).toBe('custom-message-id');
+      });
+
+      it('auto-populates targetedMessageInfo on reply to targeted message', async () => {
+        const activity = new MessageActivity('Hello world')
+          .withFrom({ id: 'test-user', name: 'Test User', role: 'user' })
+          .withRecipient({ id: 'bot-id', name: 'Bot', role: 'bot' }, true)
+          .withChannelId('test-channel')
+          .withConversation({ id: 'test-conversation', conversationType: 'channel', isGroup: false })
+          .withId('1772129782775');
+
+        context = buildActivityContext(activity);
+
+        await context.reply('Here is your agenda');
+
+        expect(mockSender.send).toHaveBeenCalledTimes(1);
+        expect(mockSender.send).toHaveBeenCalledWith(
+          expect.objectContaining({
+            type: 'message',
+            entities: expect.arrayContaining([
+              expect.objectContaining({
+                type: 'targetedMessageInfo',
+                messageId: '1772129782775',
+              }),
+            ]),
+          }),
+          mockRef
+        );
+      });
     });
   });
 
@@ -282,7 +481,7 @@ describe('ActivityContext', () => {
     });
 
     it('creates new 1:1 conversation for group chat signin', async () => {
-      context = new ActivityContext(mockSender, {
+      context = new ActivityContext({
         ...context,
         activity: {
           ...buildIncomingMessageActivity('Test message'),
@@ -292,6 +491,7 @@ describe('ActivityContext', () => {
             conversationType: 'group',
           },
         },
+        activitySender: mockSender,
       });
 
       mockApiClient.users.token.get.mockRejectedValueOnce(

@@ -6,24 +6,25 @@ import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 
-import { jsonSchemaToZod } from 'json-schema-to-zod';
+import express from 'express';
 import { z } from 'zod';
 
 import { IChatPrompt } from '@microsoft/teams.ai';
 import {
-  Dependency,
-  HttpPlugin,
+  ExpressAdapter,
+  HttpServer,
+  IHttpServer,
   IPlugin,
   IPluginStartEvent,
   Logger,
   Plugin,
 } from '@microsoft/teams.apps';
 import { ILogger } from '@microsoft/teams.common';
-import { DevtoolsPlugin } from '@microsoft/teams.dev';
 
 import pkg from '../package.json';
 
 import { IConnection } from './connection';
+import { jsonSchemaToZod } from './json-schema-to-zod';
 
 /**
  * MCP transport options for sse
@@ -91,6 +92,14 @@ export type McpPluginOptions = ServerOptions & {
    * @default `http://localhost:5173`
    */
   readonly inspector?: string;
+
+  /**
+   * Gate inbound MCP requests behind an authentication check. Called once per
+   * request; return `true` to allow, `false` (or throw) to reject with 401.
+   * When unset, all requests are accepted and a warning is emitted at plugin
+   * startup.
+   */
+  readonly requireAuth?: (req: express.Request) => boolean | Promise<boolean>;
 };
 
 /**
@@ -111,11 +120,8 @@ export class McpPlugin implements IPlugin {
   @Logger()
   readonly logger!: ILogger;
 
-  @Dependency()
-  readonly httpPlugin!: HttpPlugin;
-
-  @Dependency({ optional: true })
-  readonly devtoolsPlugin?: DevtoolsPlugin;
+  @HttpServer()
+  readonly httpServer!: IHttpServer;
 
   readonly server: McpServer;
   protected id: number = -1;
@@ -124,6 +130,7 @@ export class McpPlugin implements IPlugin {
   protected transport: McpSSETransportOptions | McpStdioTransportOptions = {
     type: 'sse',
   };
+  protected requireAuth?: (req: express.Request) => boolean | Promise<boolean>;
 
   constructor(options: McpServer | McpPluginOptions = {}) {
     this.inspector =
@@ -141,8 +148,11 @@ export class McpPlugin implements IPlugin {
           options,
         );
 
-    if (!(options instanceof McpServer) && options.transport) {
-      this.transport = options.transport;
+    if (!(options instanceof McpServer)) {
+      if (options.transport) {
+        this.transport = options.transport;
+      }
+      this.requireAuth = options.requireAuth;
     }
   }
 
@@ -152,13 +162,21 @@ export class McpPlugin implements IPlugin {
    */
   use(prompt: IChatPrompt) {
     for (const fn of prompt.functions) {
-      const schema: z.AnyZodObject = eval(
-        jsonSchemaToZod(fn.parameters, { module: 'cjs' }),
-      );
+      if (fn.parameters.type !== undefined && fn.parameters.type !== 'object') {
+        throw new Error(
+          `McpPlugin.use: parameters for tool "${fn.name}" must be an object schema (got type "${fn.parameters.type}")`
+        );
+      }
+
+      const zodSchema = jsonSchemaToZod(fn.parameters);
+      const shape =
+        zodSchema instanceof z.ZodObject
+          ? (zodSchema as z.AnyZodObject).shape
+          : {};
       this.server.tool(
         fn.name,
         fn.description,
-        schema.shape,
+        shape,
         this.onToolCall(fn.name, prompt)
       );
     }
@@ -191,14 +209,8 @@ export class McpPlugin implements IPlugin {
   }
 
   onInit() {
-    this.devtoolsPlugin?.addPage({
-      name: 'mcp',
-      displayName: 'MCP',
-      url: this.inspector,
-    });
-
     if (this.transport.type === 'sse') {
-      return this.onInitSSE(this.httpPlugin, this.transport);
+      return this.onInitSSE(this.transport);
     }
 
     return this.onInitStdio(this.transport);
@@ -206,6 +218,11 @@ export class McpPlugin implements IPlugin {
 
   onStart({ port }: IPluginStartEvent) {
     if (this.transport.type === 'sse') {
+      if (!this.requireAuth) {
+        this.logger.warn(
+          `McpPlugin started without requireAuth. All MCP requests at ${this.transport.path || '/mcp'} will be accepted. Pass requireAuth in McpPluginOptions to enforce authentication.`
+        );
+      }
       this.logger.info(
         `listening at http://localhost:${port}${this.transport.path || '/mcp'}`,
       );
@@ -214,15 +231,47 @@ export class McpPlugin implements IPlugin {
     }
   }
 
+  protected async checkAuth(
+    req: express.Request,
+    res: express.Response
+  ): Promise<boolean> {
+    if (!this.requireAuth) return true;
+    try {
+      const ok = await this.requireAuth(req);
+      if (ok) return true;
+    } catch (err) {
+      this.logger.debug('requireAuth threw:', err);
+    }
+    if (req.aborted) return false;
+    res.set('WWW-Authenticate', 'Bearer').status(401).send('unauthorized');
+    return false;
+  }
+
   protected onInitStdio(options: McpStdioTransportOptions) {
     const transport = new StdioServerTransport(options.stdin, options.stdout);
     return this.server.connect(transport);
   }
 
-  protected onInitSSE(http: HttpPlugin, options: McpSSETransportOptions) {
+  protected onInitSSE(options: McpSSETransportOptions) {
     const path = options.path || '/mcp';
 
-    http.get(path, (_, res) => {
+    const adapter = this.httpServer.adapter;
+    if (!(adapter instanceof ExpressAdapter)) {
+      throw new Error(
+        'McpPlugin with SSE transport requires ExpressAdapter. ' +
+        'Please use: new App({ httpServerAdapter: new ExpressAdapter() })'
+      );
+    }
+
+    // Auth gate applied to the entire MCP path prefix so any current or future
+    // handler registered under this path is covered.
+    adapter.use(path, async (req: express.Request, res: express.Response, next: express.NextFunction) => {
+      if (!(await this.checkAuth(req, res))) return;
+      next();
+    });
+
+    // Register GET endpoint for SSE connections
+    adapter.get(path, (_: express.Request, res: express.Response) => {
       this.id++;
       this.logger.debug('connecting...');
       const transport = new SSEServerTransport(
@@ -238,7 +287,8 @@ export class McpPlugin implements IPlugin {
       this.server.connect(transport);
     });
 
-    http.post(`${path}/:id/messages`, (req, res) => {
+    // Register POST endpoint for SSE messages
+    adapter.post(`${path}/:id/messages`, (req: express.Request, res: express.Response) => {
       const id = +req.params.id;
       const { transport } = this.connections[id];
 
@@ -285,7 +335,7 @@ export class McpPlugin implements IPlugin {
   }
 
   protected isCallToolResult(value: any): value is CallToolResult {
-    if (!!value || !('content' in value)) return false;
+    if (!value || typeof value !== 'object' || !('content' in value)) return false;
     const { content } = value;
 
     return (

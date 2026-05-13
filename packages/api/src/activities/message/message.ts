@@ -9,6 +9,7 @@ import {
   Importance,
   InputHint,
   MentionEntity,
+  QuotedReplyEntity,
   SuggestedActions,
   TextFormat,
 } from '../../models';
@@ -23,6 +24,7 @@ export interface IMessageActivity extends IActivity<'message'> {
 
   /**
    * The text to speak.
+   * @deprecated This will be removed by end of summer 2026.
    */
   speak?: string;
 
@@ -30,6 +32,7 @@ export interface IMessageActivity extends IActivity<'message'> {
    * Indicates whether your bot is accepting,
    * expecting, or ignoring user input after the message is delivered to the client. Possible
    * values include: 'acceptingInput', 'ignoringInput', 'expectingInput'
+   * @deprecated This will be removed by end of summer 2026.
    */
   inputHint?: InputHint;
 
@@ -61,6 +64,7 @@ export interface IMessageActivity extends IActivity<'message'> {
 
   /**
    * The importance of the activity. Possible values include: 'low', 'normal', 'high'
+   * @deprecated This will be removed by end of summer 2026.
    */
   importance?: Importance;
 
@@ -73,6 +77,7 @@ export interface IMessageActivity extends IActivity<'message'> {
   /**
    * The time at which the activity should be considered to be "expired" and should not be
    * presented to the recipient.
+   * @deprecated This will be removed by end of summer 2026.
    */
   expiration?: Date;
 
@@ -95,6 +100,14 @@ export interface IMessageActivity extends IActivity<'message'> {
    * get a mention by the account id if exists
    */
   getAccountMention(accountId: string): MentionEntity | undefined;
+
+  /**
+   * get all quoted reply entities from this message
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsQuotedReplies
+   */
+  getQuotedMessages(): QuotedReplyEntity[];
 }
 
 export class MessageActivity extends Activity<'message'> implements IMessageActivity {
@@ -105,6 +118,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
 
   /**
    * The text to speak.
+   * @deprecated This will be removed by end of summer 2026.
    */
   speak?: string;
 
@@ -112,6 +126,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
    * Indicates whether your bot is accepting,
    * expecting, or ignoring user input after the message is delivered to the client. Possible
    * values include: 'acceptingInput', 'ignoringInput', 'expectingInput'
+   * @deprecated This will be removed by end of summer 2026.
    */
   inputHint?: InputHint;
 
@@ -143,6 +158,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
 
   /**
    * The importance of the activity. Possible values include: 'low', 'normal', 'high'
+   * @deprecated This will be removed by end of summer 2026.
    */
   importance?: Importance;
 
@@ -155,6 +171,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
   /**
    * The time at which the activity should be considered to be "expired" and should not be
    * presented to the recipient.
+   * @deprecated This will be removed by end of summer 2026.
    */
   expiration?: Date;
 
@@ -188,6 +205,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
         stripMentionsText: this.stripMentionsText.bind(this),
         isRecipientMentioned: this.isRecipientMentioned.bind(this),
         getAccountMention: this.getAccountMention.bind(this),
+        getQuotedMessages: this.getQuotedMessages.bind(this),
       },
       this
     );
@@ -213,6 +231,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
 
   /**
    * The text to speak.
+   * @deprecated This will be removed by end of summer 2026.
    */
   withSpeak(value: string) {
     this.speak = value;
@@ -223,6 +242,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
    * Indicates whether your bot is accepting,
    * expecting, or ignoring user input after the message is delivered to the client. Possible
    * values include: 'acceptingInput', 'ignoringInput', 'expectingInput'
+   * @deprecated This will be removed by end of summer 2026.
    */
   withInputHint(value: InputHint) {
     this.inputHint = value;
@@ -264,6 +284,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
 
   /**
    * The importance of the activity. Possible values include: 'low', 'normal', 'high'
+   * @deprecated This will be removed by end of summer 2026.
    */
   withImportance(value: Importance) {
     this.importance = value;
@@ -282,6 +303,7 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
   /**
    * The time at which the activity should be considered to be "expired" and should not be
    * presented to the recipient.
+   * @deprecated This will be removed by end of summer 2026.
    */
   withExpiration(value: Date) {
     this.expiration = value;
@@ -362,6 +384,18 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
   }
 
   /**
+   * get all quoted reply entities from this message
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsQuotedReplies
+   */
+  getQuotedMessages(): QuotedReplyEntity[] {
+    return (this.entities ?? []).filter(
+      (e): e is QuotedReplyEntity => e.type === 'quotedReply'
+    );
+  }
+
+  /**
    * Add stream info, making
    * this a final stream message
    */
@@ -378,6 +412,69 @@ export class MessageActivity extends Activity<'message'> implements IMessageActi
       streamId: this.id,
       streamType: 'final',
     });
+  }
+
+  /**
+   * Set the recipient of this message, optionally marking it as a targeted (ephemeral) message.
+   * Targeted messages are only visible to the specified recipient in a shared conversation.
+   * @param account - The recipient account
+   * @param isTargeted - If true, marks this as a targeted message visible only to the recipient
+   * @returns this instance for chaining
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsTargeted
+   */
+  withRecipient(account: Account, isTargeted: boolean = false): this {
+    super.withRecipient(account, isTargeted);
+    return this;
+  }
+
+  /**
+   * Add a quoted message reference and append a `<quoted messageId="..."/>` placeholder to text.
+   * Teams renders the quoted message as a preview bubble above the response text.
+   * If text is provided, it is appended to the quoted message placeholder.
+   * @param messageId - The ID of the message to quote
+   * @param text - Optional text, appended to the quoted message placeholder
+   * @returns this instance for chaining
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsQuotedReplies
+   */
+  addQuote(messageId: string, text?: string): this {
+    if (!this.entities) {
+      this.entities = [];
+    }
+    this.entities.push({
+      type: 'quotedReply',
+      quotedReply: { messageId },
+    });
+    this.addText(`<quoted messageId="${messageId}"/>`);
+    if (text) {
+      this.addText(` ${text}`);
+    }
+    return this;
+  }
+
+  /**
+   * Prepend a quotedReply entity and `<quoted messageId="..."/>` placeholder
+   * before existing text. Used by reply()/quote() for quote-above-response.
+   * @param messageId - The IC3 message ID of the message to quote
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsQuotedReplies
+   */
+  prependQuote(messageId: string): this {
+    if (!this.entities) {
+      this.entities = [];
+    }
+    this.entities.push({
+      type: 'quotedReply',
+      quotedReply: { messageId },
+    });
+    const placeholder = `<quoted messageId="${messageId}"/>`;
+    const hasText = !!this.text?.trim();
+    this.text = hasText ? `${placeholder} ${this.text}` : placeholder;
+    return this;
   }
 }
 

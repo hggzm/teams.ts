@@ -1,17 +1,19 @@
-import * as http from '@microsoft/teams.common/http';
+import { AxiosError } from 'axios';
 
-import { Client } from './index';
+import { Client as HttpClient } from '@microsoft/teams.common';
+
+import { Client, GraphError } from './index';
 
 import type { EndpointRequest } from './types';
 
 // Mock the http module
-jest.mock('@microsoft/teams.common/http', () => ({
+jest.mock('@microsoft/teams.common', () => ({
   Client: jest.fn(),
 }));
 
 describe('Client', () => {
-  let mockHttpClient: jest.Mocked<http.Client>;
-  let mockBetaHttpClient: jest.Mocked<http.Client>;
+  let mockHttpClient: jest.Mocked<HttpClient>;
+  let mockBetaHttpClient: jest.Mocked<HttpClient>;
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -39,7 +41,7 @@ describe('Client', () => {
     // Setup clone to return beta client
     mockHttpClient.clone.mockReturnValue(mockBetaHttpClient);
 
-    (http.Client as jest.MockedClass<typeof http.Client>).mockImplementation(
+    (HttpClient as jest.MockedClass<typeof HttpClient>).mockImplementation(
       () => mockHttpClient,
     );
   });
@@ -47,7 +49,7 @@ describe('Client', () => {
   describe('constructor', () => {
     it('should create client with default base URL', () => {
       new Client();
-      expect(http.Client).toHaveBeenCalledWith({
+      expect(HttpClient).toHaveBeenCalledWith({
         baseUrl: 'https://graph.microsoft.com/v1.0',
         headers: {
           'Content-Type': 'application/json',
@@ -61,7 +63,7 @@ describe('Client', () => {
         baseUrlRoot: 'https://graph.microsoft.us',
       });
 
-      expect(http.Client).toHaveBeenCalledWith({
+      expect(HttpClient).toHaveBeenCalledWith({
         baseUrlRoot: 'https://graph.microsoft.us',
         baseUrl: 'https://graph.microsoft.us/v1.0',
         headers: {
@@ -79,7 +81,7 @@ describe('Client', () => {
         timeout: 10000,
       });
 
-      expect(http.Client).toHaveBeenCalledWith({
+      expect(HttpClient).toHaveBeenCalledWith({
         baseUrlRoot: 'https://graph.microsoft.de',
         timeout: 10000,
         baseUrl: 'https://graph.microsoft.de/v1.0',
@@ -101,6 +103,69 @@ describe('Client', () => {
 
       expect(existingClient.clone).toHaveBeenCalledWith({
         baseUrl: 'https://graph.microsoft.com/v1.0',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': expect.stringMatching(/^teams\.ts\[graph\]\/.+/),
+        },
+      });
+    });
+
+    it('should clone existing client and route to sovereign base URL via graphOptions.baseUrlRoot', () => {
+      const existingClient = {
+        ...mockHttpClient,
+        request: jest.fn(),
+        clone: jest.fn().mockReturnValue(mockHttpClient),
+      };
+      new Client(existingClient as any, { baseUrlRoot: 'https://graph.microsoft.us' });
+
+      expect(existingClient.clone).toHaveBeenCalledWith({
+        baseUrl: 'https://graph.microsoft.us/v1.0',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': expect.stringMatching(/^teams\.ts\[graph\]\/.+/),
+        },
+      });
+    });
+
+    it('should honor graphOptions.baseUrlRoot when no options provided', () => {
+      new Client(undefined, { baseUrlRoot: 'https://graph.microsoft.us' });
+
+      expect(HttpClient).toHaveBeenCalledWith({
+        baseUrl: 'https://graph.microsoft.us/v1.0',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': expect.stringMatching(/^teams\.ts\[graph\]\/.+/),
+        },
+      });
+    });
+
+    it('should prefer graphOptions.baseUrlRoot over options.baseUrlRoot', () => {
+      new Client(
+        { baseUrlRoot: 'https://graph.microsoft.com' },
+        { baseUrlRoot: 'https://graph.microsoft.us' }
+      );
+
+      expect(HttpClient).toHaveBeenCalledWith({
+        baseUrlRoot: 'https://graph.microsoft.com',
+        baseUrl: 'https://graph.microsoft.us/v1.0',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': expect.stringMatching(/^teams\.ts\[graph\]\/.+/),
+        },
+      });
+    });
+
+    it('should honor options.baseUrlRoot when baseUrlRoot is attached to an existing client', () => {
+      const existingClient = {
+        ...mockHttpClient,
+        request: jest.fn(),
+        clone: jest.fn().mockReturnValue(mockHttpClient),
+        baseUrlRoot: 'https://graph.microsoft.us',
+      };
+      new Client(existingClient as any);
+
+      expect(existingClient.clone).toHaveBeenCalledWith({
+        baseUrl: 'https://graph.microsoft.us/v1.0',
         headers: {
           'Content-Type': 'application/json',
           'User-Agent': expect.stringMatching(/^teams\.ts\[graph\]\/.+/),
@@ -954,6 +1019,112 @@ describe('Client', () => {
           await expect(client.call(mockEndpoint)).rejects.toThrow(
             'Network error',
           );
+        });
+
+        it('should throw GraphError with response body for axios errors', async () => {
+          const responseData = {
+            error: {
+              code: 'Authorization_RequestDenied',
+              message: 'Insufficient privileges to complete the operation.',
+            },
+          };
+          const axiosError = new AxiosError(
+            'Request failed with status code 403',
+            'ERR_BAD_REQUEST',
+            undefined,
+            undefined,
+            { status: 403, data: responseData, statusText: 'Forbidden', headers: {}, config: {} as any },
+          );
+          mockHttpClient.get.mockRejectedValue(axiosError);
+
+          const mockEndpoint = jest.fn(
+            (): EndpointRequest<any> => ({
+              method: 'get',
+              path: '/chats/{chatId}/messages',
+              paramDefs: { path: ['chatId'] },
+              params: { chatId: 'chat-123' },
+            }),
+          );
+
+          const rejection = expect(client.call(mockEndpoint)).rejects;
+          await rejection.toBeInstanceOf(GraphError);
+          await rejection.toMatchObject({
+            statusCode: 403,
+            code: 'Authorization_RequestDenied',
+            body: responseData,
+            source: axiosError,
+          });
+          await rejection.toThrow(/Insufficient privileges/);
+        });
+
+        it('should throw GraphError with status for non-standard error bodies', async () => {
+          const axiosError = new AxiosError(
+            'Request failed with status code 500',
+            'ERR_BAD_RESPONSE',
+            undefined,
+            undefined,
+            { status: 500, data: 'Internal Server Error', statusText: 'Internal Server Error', headers: {}, config: {} as any },
+          );
+          mockHttpClient.get.mockRejectedValue(axiosError);
+
+          const mockEndpoint = jest.fn(
+            (): EndpointRequest<any> => ({
+              method: 'get',
+              path: '/users',
+            }),
+          );
+
+          const rejection = expect(client.call(mockEndpoint)).rejects;
+          await rejection.toBeInstanceOf(GraphError);
+          await rejection.toMatchObject({
+            statusCode: 500,
+            code: undefined,
+          });
+          await rejection.toThrow(/failed with status 500/);
+        });
+
+        it('should not expose body or source via Object.keys or JSON.stringify', async () => {
+          const responseData = {
+            error: {
+              code: 'NotFound',
+              message: 'Resource not found.',
+            },
+          };
+          const axiosError = new AxiosError(
+            'Request failed with status code 404',
+            'ERR_BAD_REQUEST',
+            undefined,
+            undefined,
+            { status: 404, data: responseData, statusText: 'Not Found', headers: {}, config: {} as any },
+          );
+          mockHttpClient.get.mockRejectedValue(axiosError);
+
+          const mockEndpoint = jest.fn(
+            (): EndpointRequest<any> => ({
+              method: 'get',
+              path: '/users/{id}',
+              paramDefs: { path: ['id'] },
+              params: { id: '123' },
+            }),
+          );
+
+          try {
+            await client.call(mockEndpoint);
+            fail('Expected GraphError to be thrown');
+          } catch (err) {
+            expect(err).toBeInstanceOf(GraphError);
+            const graphErr = err as GraphError;
+
+            // body and source are accessible directly
+            expect(graphErr.body).toEqual(responseData);
+            expect(graphErr.source).toBe(axiosError);
+
+            // but hidden from enumeration and serialization
+            expect(Object.keys(graphErr)).not.toContain('body');
+            expect(Object.keys(graphErr)).not.toContain('source');
+            const serialized = JSON.stringify(graphErr);
+            expect(serialized).not.toContain('Resource not found');
+          }
         });
       });
     });

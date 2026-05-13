@@ -276,4 +276,190 @@ describe('MessageActivity', () => {
       expect(mention).toBeUndefined();
     });
   });
+
+  describe('withRecipient', () => {
+    it('should default to not targeted', () => {
+      const activity = new MessageActivity('hello').withRecipient({ id: '1', name: '', role: 'user' });
+
+      expect(activity.recipient.isTargeted).toBeUndefined();
+      expect(activity.recipient).toBeDefined();
+    });
+
+    it('should set isTargeted when second parameter is true', () => {
+      const activity = new MessageActivity('hello').withRecipient({ id: '1', name: '', role: 'user' }, true);
+
+      expect(activity.recipient.isTargeted).toBe(true);
+      expect(activity.recipient).toBeDefined();
+    });
+
+    it('should set isTargeted and recipient with full account', () => {
+      const activity = new MessageActivity('hello').withRecipient(
+        { id: 'user-123', name: 'user', role: 'user' },
+        true
+      );
+
+      expect(activity.recipient.isTargeted).toBe(true);
+      expect(activity.recipient).toBeDefined();
+      expect(activity.recipient.id).toBe('user-123');
+      expect(activity.recipient.name).toBe('user');
+      expect(activity.recipient.role).toBe('user');
+    });
+
+    it('should maintain fluent chaining', () => {
+      const activity = new MessageActivity('hello')
+        .withImportance('high')
+        .withRecipient({ id: 'user-123', name: '', role: 'user' })
+        .addText(' world');
+
+      expect(activity.text).toBe('hello world');
+      expect(activity.importance).toBe('high');
+      expect(activity.recipient).toBeDefined();
+      expect(activity.recipient.id).toBe('user-123');
+      expect(activity.recipient.isTargeted).toBeUndefined();
+    });
+
+    it('should be chainable with targeted flag', () => {
+      const activity = new MessageActivity('hello')
+        .withImportance('high')
+        .withRecipient({ id: 'user-456', name: '', role: 'user' }, true)
+        .withDeliveryMode('notification');
+
+      expect(activity.text).toBe('hello');
+      expect(activity.importance).toBe('high');
+      expect(activity.deliveryMode).toBe('notification');
+      expect(activity.recipient.isTargeted).toBe(true);
+      expect(activity.recipient.id).toBe('user-456');
+    });
+
+    it('should preserve isTargeted and recipient when using from()', () => {
+      const original = new MessageActivity('test')
+        .withRecipient({ id: 'user-789', name: '', role: 'user' }, true)
+        .toInterface();
+
+      const restored = MessageActivity.from(original);
+
+      expect(restored.recipient.isTargeted).toBe(true);
+      expect(restored.recipient.id).toBe('user-789');
+    });
+
+    it('should validate fluent API', () => {
+      const msg = new MessageActivity('Hello')
+        .withDeliveryMode('notification')
+        .withRecipient({ id: 'user-123', name: 'Test User', role: 'user' }, true)
+        .withImportance('high');
+
+      expect(msg.text).toBe('Hello');
+      expect(msg.recipient.isTargeted).toBe(true);
+      expect(msg.recipient).toBeDefined();
+      expect(msg.recipient.id).toBe('user-123');
+      expect(msg.recipient.name).toBe('Test User');
+      expect(msg.recipient.role).toBe('user');
+    });
+  });
+
+  describe('getQuotedMessages', () => {
+    it('should return quoted reply entities', () => {
+      const activity = new MessageActivity('hello');
+      activity.addEntity({
+        type: 'quotedReply',
+        quotedReply: { messageId: 'msg-1' },
+      });
+
+      expect(activity.getQuotedMessages()).toHaveLength(1);
+      expect(activity.getQuotedMessages()[0].quotedReply.messageId).toEqual('msg-1');
+    });
+
+    it('should return empty array when no quoted replies', () => {
+      const activity = new MessageActivity('hello');
+      expect(activity.getQuotedMessages()).toHaveLength(0);
+    });
+
+    it('should return empty array when no entities', () => {
+      const activity = new MessageActivity('hello');
+      activity.entities = undefined;
+      expect(activity.getQuotedMessages()).toHaveLength(0);
+    });
+
+    it('should filter out non-quoted-reply entities', () => {
+      const activity = new MessageActivity('hello')
+        .addMention({ id: '1', name: 'user', role: 'user' });
+      activity.addEntity({
+        type: 'quotedReply',
+        quotedReply: { messageId: 'msg-1' },
+      });
+
+      expect(activity.getQuotedMessages()).toHaveLength(1);
+      expect(activity.entities).toHaveLength(2);
+    });
+
+    it('should return multiple quoted replies', () => {
+      const activity = new MessageActivity('hello');
+      activity.addEntity({
+        type: 'quotedReply',
+        quotedReply: { messageId: 'msg-1' },
+      });
+      activity.addEntity({
+        type: 'quotedReply',
+        quotedReply: { messageId: 'msg-2' },
+      });
+
+      expect(activity.getQuotedMessages()).toHaveLength(2);
+      expect(activity.getQuotedMessages()[0].quotedReply.messageId).toEqual('msg-1');
+      expect(activity.getQuotedMessages()[1].quotedReply.messageId).toEqual('msg-2');
+    });
+
+    it('should be accessible via toInterface', () => {
+      const activity = new MessageActivity('hello');
+      activity.addEntity({
+        type: 'quotedReply',
+        quotedReply: { messageId: 'msg-1' },
+      });
+
+      const iface = activity.toInterface();
+      expect(iface.getQuotedMessages()).toHaveLength(1);
+      expect(iface.getQuotedMessages()[0].quotedReply.messageId).toEqual('msg-1');
+    });
+  });
+
+  describe('addQuote', () => {
+    it('should add entity and append placeholder', () => {
+      const activity = new MessageActivity().addQuote('msg-1');
+      expect(activity.entities).toHaveLength(1);
+      expect(activity.entities![0]).toEqual(
+        expect.objectContaining({ type: 'quotedReply', quotedReply: { messageId: 'msg-1' } })
+      );
+      expect(activity.text).toEqual('<quoted messageId="msg-1"/>');
+    });
+
+    it('should append response text after placeholder', () => {
+      const activity = new MessageActivity().addQuote('msg-1', 'my response');
+      expect(activity.text).toEqual('<quoted messageId="msg-1"/> my response');
+    });
+
+    it('should support multi-quote with interleaved responses', () => {
+      const activity = new MessageActivity()
+        .addQuote('msg-1', 'response to first')
+        .addQuote('msg-2', 'response to second');
+      expect(activity.text).toEqual(
+        '<quoted messageId="msg-1"/> response to first<quoted messageId="msg-2"/> response to second'
+      );
+      expect(activity.entities).toHaveLength(2);
+    });
+
+    it('should support grouped quotes', () => {
+      const activity = new MessageActivity()
+        .addQuote('msg-1')
+        .addQuote('msg-2', 'response to both');
+      expect(activity.text).toEqual(
+        '<quoted messageId="msg-1"/><quoted messageId="msg-2"/> response to both'
+      );
+    });
+
+    it('should be chainable', () => {
+      const activity = new MessageActivity()
+        .addQuote('msg-1')
+        .addText(' manual text');
+      expect(activity.text).toEqual('<quoted messageId="msg-1"/> manual text');
+    });
+  });
 });

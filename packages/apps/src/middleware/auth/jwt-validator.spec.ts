@@ -2,7 +2,7 @@ import crypto from 'crypto';
 
 import jwt from 'jsonwebtoken';
 
-import { JwtValidator, createEntraTokenValidator, createServiceTokenValidator } from './jwt-validator';
+import { JwtValidator, createEntraTokenValidator } from './jwt-validator';
 
 // Generate test RSA key pair
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', {
@@ -160,6 +160,51 @@ describe('JwtValidator', () => {
 
         expect(result).toEqual(expect.objectContaining(mockTokenPayload));
       });
+
+      it.each([
+        ['clientId', mockClientId],
+        ['api://botid-{clientId}', `api://botid-${mockClientId}`],
+        ['api://{clientId}', `api://${mockClientId}`],
+      ])('should accept %s audience', async (_label, aud) => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: mockTenantId,
+          jwksUriOptions: { type: 'tenantId' }
+        });
+
+        const token = createTestToken({ ...mockTokenPayload, aud });
+        const result = await validator.validateAccessToken(token);
+
+        expect(result).not.toBeNull();
+      });
+
+      it('should accept custom audience values', async () => {
+        const customAudience = 'api://my-custom-app.contoso.com/test-client-id';
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: mockTenantId,
+          audience: [customAudience],
+          jwksUriOptions: { type: 'tenantId' }
+        });
+
+        const token = createTestToken({ ...mockTokenPayload, aud: customAudience });
+        const result = await validator.validateAccessToken(token);
+
+        expect(result).not.toBeNull();
+      });
+
+      it('should reject unrecognized audience', async () => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: mockTenantId,
+          jwksUriOptions: { type: 'tenantId' }
+        }, mockLogger);
+
+        const token = createTestToken({ ...mockTokenPayload, aud: 'api://wrong-client-id' });
+        const result = await validator.validateAccessToken(token);
+
+        expect(result).toBeNull();
+      });
     });
 
     describe('issuer validation', () => {
@@ -225,6 +270,26 @@ describe('JwtValidator', () => {
         expect(result).toEqual(expect.objectContaining(mockTokenPayload)); // Single-tenant ignores allowedTenantIds
       });
 
+      it('should accept v1 sts issuer for single-tenant apps', async () => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: mockTenantId,
+          jwksUriOptions: { type: 'tenantId' },
+          validateIssuer: { allowedTenantIds: ['different-tenant'] }
+        });
+
+        const token = createTestToken({
+          ...mockTokenPayload,
+          iss: `https://sts.windows.net/${mockTenantId}/`
+        });
+        const result = await validator.validateAccessToken(token);
+
+        expect(result).toEqual(expect.objectContaining({
+          ...mockTokenPayload,
+          iss: `https://sts.windows.net/${mockTenantId}/`
+        }));
+      });
+
       it('should validate tenant-based issuer for multi-tenant apps', async () => {
         const validator = new JwtValidator({
           clientId: mockClientId,
@@ -236,6 +301,26 @@ describe('JwtValidator', () => {
         const result = await validator.validateAccessToken(validToken);
 
         expect(result).toEqual(expect.objectContaining(mockTokenPayload));
+      });
+
+      it('should accept v1 sts issuer for multi-tenant apps', async () => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: 'common',
+          jwksUriOptions: { type: 'tenantId' },
+          validateIssuer: { allowedTenantIds: [mockTenantId] }
+        });
+
+        const token = createTestToken({
+          ...mockTokenPayload,
+          iss: `https://sts.windows.net/${mockTenantId}/`
+        });
+        const result = await validator.validateAccessToken(token);
+
+        expect(result).toEqual(expect.objectContaining({
+          ...mockTokenPayload,
+          iss: `https://sts.windows.net/${mockTenantId}/`
+        }));
       });
 
       it('should reject invalid tenant issuer for multi-tenant apps', async () => {
@@ -253,6 +338,42 @@ describe('JwtValidator', () => {
           'Custom validation failed:',
           expect.objectContaining({
             message: expect.stringContaining('not in allowed tenant IDs')
+          })
+        );
+      });
+
+      it.each([
+        ['empty object', {} as any],
+        ['allowedTenantIds: undefined', { allowedTenantIds: undefined }],
+        ['allowedTenantIds: []', { allowedTenantIds: [] }],
+      ])('should skip validation when validateIssuer is %s', async (_label, validateIssuer) => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: 'common',
+          jwksUriOptions: { type: 'tenantId' },
+          validateIssuer
+        });
+
+        const result = await validator.validateAccessToken(validToken);
+
+        expect(result).toEqual(expect.objectContaining(mockTokenPayload));
+      });
+
+      it('should throw when allowedTenantIds is configured but tenantId is missing', async () => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          // tenantId intentionally omitted
+          jwksUriOptions: { type: 'tenantId' },
+          validateIssuer: { allowedTenantIds: [mockTenantId] }
+        }, mockLogger);
+
+        const result = await validator.validateAccessToken(validToken);
+
+        expect(result).toBeNull();
+        expect(mockLogger.error).toHaveBeenCalledWith(
+          'Custom validation failed:',
+          expect.objectContaining({
+            message: 'Tenant ID is required when allowedTenantIds is configured'
           })
         );
       });
@@ -306,6 +427,51 @@ describe('JwtValidator', () => {
         const result = await validator.validateAccessToken(validToken);
 
         expect(result).toEqual(expect.objectContaining(mockTokenPayload));
+      });
+
+      it('should reject token with substring-matching scope', async () => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: mockTenantId,
+          jwksUriOptions: { type: 'tenantId' },
+          validateScope: { requiredScope: 'User.Read' }
+        }, mockLogger);
+
+        const substringToken = createTestToken({
+          ...mockTokenPayload,
+          scp: 'User.ReadBasic.All'
+        });
+
+        const result = await validator.validateAccessToken(substringToken);
+
+        expect(result).toBeNull();
+        expect(mockLogger.error).toHaveBeenCalledWith(
+          'Custom validation failed:',
+          expect.objectContaining({
+            message: 'Token missing required scope: User.Read'
+          })
+        );
+      });
+
+      it('should accept exact scope among multiple scopes', async () => {
+        const validator = new JwtValidator({
+          clientId: mockClientId,
+          tenantId: mockTenantId,
+          jwksUriOptions: { type: 'tenantId' },
+          validateScope: { requiredScope: 'User.Read' }
+        });
+
+        const multiScopeToken = createTestToken({
+          ...mockTokenPayload,
+          scp: 'Mail.Read User.Read Files.ReadWrite'
+        });
+
+        const result = await validator.validateAccessToken(multiScopeToken);
+
+        expect(result).toEqual(expect.objectContaining({
+          ...mockTokenPayload,
+          scp: 'Mail.Read User.Read Files.ReadWrite'
+        }));
       });
 
       it('should reject token with missing scope', async () => {
@@ -571,45 +737,22 @@ describe('JwtValidator', () => {
 
         expect(validator.options.validateScope).toBeUndefined();
       });
+
+      it('should pass applicationIdUri as audience', () => {
+        const validator = createEntraTokenValidator(mockTenantId, mockClientId, {
+          applicationIdUri: 'api://my-app.contoso.com/test-client-id'
+        });
+
+        expect(validator.options.audience).toEqual(['api://my-app.contoso.com/test-client-id']);
+      });
+
+      it('should not set audience when no audience options are provided', () => {
+        const validator = createEntraTokenValidator(mockTenantId, mockClientId);
+
+        expect(validator.options.audience).toBeUndefined();
+      });
     });
 
-    describe('createServiceTokenValidator', () => {
-      it('should create validator with minimal options', () => {
-        const validator = createServiceTokenValidator(mockClientId, mockTenantId);
-
-        expect(validator).toBeInstanceOf(JwtValidator);
-        expect(validator.options.clientId).toBe(mockClientId);
-        expect(validator.options.tenantId).toBe(mockTenantId);
-        expect(validator.options.validateIssuer).toEqual({
-          allowedIssuer: 'https://api.botframework.com'
-        });
-        expect(validator.options.jwksUriOptions).toEqual({
-          type: 'uri',
-          uri: 'https://login.botframework.com/v1/.well-known/keys'
-        });
-      });
-
-      it('should create validator with service URL', () => {
-        const serviceUrl = 'https://example.com/api';
-        const validator = createServiceTokenValidator(mockClientId, mockTenantId, serviceUrl);
-
-        expect(validator.options.validateServiceUrl).toEqual({
-          expectedServiceUrl: serviceUrl
-        });
-      });
-
-      it('should create validator without service URL validation when not provided', () => {
-        const validator = createServiceTokenValidator(mockClientId, mockTenantId);
-
-        expect(validator.options.validateServiceUrl).toBeUndefined();
-      });
-
-      it('should create validator with logger', () => {
-        const validator = createServiceTokenValidator(mockClientId, mockTenantId, undefined, mockLogger);
-
-        expect(validator).toBeInstanceOf(JwtValidator);
-      });
-    });
   });
 
   describe('error handling and logging', () => {
@@ -671,4 +814,172 @@ describe('JwtValidator', () => {
       );
     });
   });
+
+  describe('loginEndpoint support', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const jwksRsa = require('jwks-rsa');
+
+    beforeEach(() => {
+      jwksRsa.mockClear();
+      mockGetSigningKey.mockImplementation((_kid: string, callback: (...args: unknown[]) => void) => {
+        callback(null, {
+          getPublicKey: () => publicKey,
+          publicKey: publicKey
+        });
+      });
+    });
+
+    it('should use default login endpoint for JWKS URI when loginEndpoint not specified', async () => {
+      const validator = new JwtValidator({
+        clientId: mockClientId,
+        tenantId: mockTenantId,
+        jwksUriOptions: { type: 'tenantId' }
+      }, mockLogger as any);
+
+      await validator.validateAccessToken(validToken);
+
+      expect(jwksRsa).toHaveBeenCalledWith({
+        jwksUri: `https://login.microsoftonline.com/${mockTenantId}/discovery/v2.0/keys`
+      });
+    });
+
+    it('should use custom loginEndpoint for JWKS URI construction', async () => {
+      const validator = new JwtValidator({
+        clientId: mockClientId,
+        tenantId: mockTenantId,
+        loginEndpoint: 'https://login.microsoftonline.us',
+        jwksUriOptions: { type: 'tenantId' }
+      }, mockLogger as any);
+
+      await validator.validateAccessToken(validToken);
+
+      expect(jwksRsa).toHaveBeenCalledWith({
+        jwksUri: `https://login.microsoftonline.us/${mockTenantId}/discovery/v2.0/keys`
+      });
+    });
+
+    it('should use loginEndpoint for issuer prefix validation with allowedTenantIds', async () => {
+      const govTenantId = 'gov-tenant-123';
+      const govIssuer = `https://login.microsoftonline.us/${govTenantId}/v2.0`;
+
+      const token = createTestToken({
+        ...mockTokenPayload,
+        aud: mockClientId,
+        iss: govIssuer,
+      });
+
+      const validator = new JwtValidator({
+        clientId: mockClientId,
+        tenantId: govTenantId,
+        loginEndpoint: 'https://login.microsoftonline.us',
+        validateIssuer: { allowedTenantIds: [govTenantId] },
+        jwksUriOptions: { type: 'tenantId' }
+      }, mockLogger as any);
+
+      const result = await validator.validateAccessToken(token);
+      expect(result).not.toBeNull();
+      expect(result?.iss).toBe(govIssuer);
+    });
+
+    it('should reject issuer from wrong cloud with loginEndpoint set', async () => {
+      const govTenantId = 'gov-tenant-123';
+      // Token issued by public cloud
+      const publicIssuer = `https://login.microsoftonline.com/${govTenantId}/v2.0`;
+
+      const token = createTestToken({
+        ...mockTokenPayload,
+        aud: mockClientId,
+        iss: publicIssuer,
+      });
+
+      const validator = new JwtValidator({
+        clientId: mockClientId,
+        tenantId: govTenantId,
+        loginEndpoint: 'https://login.microsoftonline.us',
+        validateIssuer: { allowedTenantIds: [govTenantId] },
+        jwksUriOptions: { type: 'tenantId' }
+      }, mockLogger as any);
+
+      const result = await validator.validateAccessToken(token);
+      // Should be null because issuer from public cloud doesn't match gov loginEndpoint
+      expect(result).toBeNull();
+    });
+  });
+
+  // Modeled on the public Microsoft Entra access token samples documented at
+  // https://learn.microsoft.com/en-us/entra/identity-platform/access-tokens
+  describe('Microsoft Entra docs sample tokens', () => {
+    // From the v2 sample token in the docs
+    const v2TenantId = '72f988bf-86f1-41af-91ab-2d7cd011db47';
+    const v2ClientId = '6e74172b-be56-4843-9ff4-e66a39bb12e3';
+    const v2Payload = {
+      iat: Math.floor(mockDate.getTime() / 1000 - 300),
+      nbf: Math.floor(mockDate.getTime() / 1000 - 300),
+      exp: Math.floor(mockDate.getTime() / 1000 + 300),
+      aud: v2ClientId,
+      iss: `https://login.microsoftonline.com/${v2TenantId}/v2.0`,
+      azp: v2ClientId,
+      scp: 'access_as_user',
+      tid: v2TenantId,
+      ver: '2.0',
+    };
+
+    // From the v1 sample token in the docs
+    const v1TenantId = 'fa15d692-e9c7-4460-a743-29f2956fd429';
+    const v1ClientId = 'ef1da9d4-ff77-4c3e-a005-840c3f830745';
+    const v1Payload = {
+      iat: Math.floor(mockDate.getTime() / 1000 - 300),
+      nbf: Math.floor(mockDate.getTime() / 1000 - 300),
+      exp: Math.floor(mockDate.getTime() / 1000 + 300),
+      aud: v1ClientId,
+      iss: `https://sts.windows.net/${v1TenantId}/`,
+      appid: '75dbe77f-10a3-4e59-85fd-8c127544f17c',
+      scp: 'user_impersonation',
+      tid: v1TenantId,
+      ver: '1.0',
+    };
+
+    it('passes the v2.0 docs sample (login.microsoftonline.com/.../v2.0)', async () => {
+      const validator = new JwtValidator({
+        clientId: v2ClientId,
+        tenantId: v2TenantId,
+        jwksUriOptions: { type: 'tenantId' },
+        validateIssuer: { allowedTenantIds: [v2TenantId] },
+        validateScope: { requiredScope: 'access_as_user' },
+      }, mockLogger as any);
+
+      const result = await validator.validateAccessToken(createTestToken(v2Payload as any));
+
+      expect(result).toEqual(expect.objectContaining(v2Payload));
+    });
+
+    it('passes the v1.0 docs sample (sts.windows.net/.../) — single-tenant', async () => {
+      const validator = new JwtValidator({
+        clientId: v1ClientId,
+        tenantId: v1TenantId,
+        jwksUriOptions: { type: 'tenantId' },
+        validateIssuer: { allowedTenantIds: [v1TenantId] },
+        validateScope: { requiredScope: 'user_impersonation' },
+      }, mockLogger as any);
+
+      const result = await validator.validateAccessToken(createTestToken(v1Payload as any));
+
+      expect(result).toEqual(expect.objectContaining(v1Payload));
+    });
+
+    it('passes the v1.0 docs sample (sts.windows.net/.../) — multi-tenant', async () => {
+      const validator = new JwtValidator({
+        clientId: v1ClientId,
+        tenantId: 'common',
+        jwksUriOptions: { type: 'tenantId' },
+        validateIssuer: { allowedTenantIds: [v1TenantId] },
+        validateScope: { requiredScope: 'user_impersonation' },
+      }, mockLogger as any);
+
+      const result = await validator.validateAccessToken(createTestToken(v1Payload as any));
+
+      expect(result).toEqual(expect.objectContaining(v1Payload));
+    });
+  });
+
 });

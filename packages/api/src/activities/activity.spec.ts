@@ -1,6 +1,7 @@
 import { Account, ConversationAccount } from '../models';
 
 import { Activity } from './activity';
+import { MessageActivity } from './message';
 
 describe('Activity', () => {
   const user: Account = {
@@ -33,7 +34,6 @@ describe('Activity', () => {
         conversation: chat,
       })
       .withRecipient(bot)
-      .withReplyToId('3')
       .withServiceUrl('http://localhost')
       .withTimestamp(new Date())
       .withLocalTimestamp(new Date());
@@ -51,7 +51,6 @@ describe('Activity', () => {
     });
 
     expect(activity.recipient).toEqual(bot);
-    expect(activity.replyToId).toEqual('3');
     expect(activity.serviceUrl).toEqual('http://localhost');
     expect(activity.timestamp).toBeDefined();
     expect(activity.localTimestamp).toBeDefined();
@@ -140,12 +139,40 @@ describe('Activity', () => {
     });
   });
 
+  describe('withChannelData feedback normalization', () => {
+    it('should upgrade legacy feedbackLoopEnabled:true to feedbackLoop default', () => {
+      const activity = new Activity({ type: 'test' }).withChannelData({ feedbackLoopEnabled: true });
+
+      expect(activity.channelData?.feedbackLoop).toEqual({ type: 'default' });
+      expect(activity.channelData?.feedbackLoopEnabled).toBeUndefined();
+    });
+
+    it('should clear feedbackLoopEnabled when feedbackLoop is already set', () => {
+      const activity = new Activity({ type: 'test' }).withChannelData({
+        feedbackLoop: { type: 'custom' },
+        feedbackLoopEnabled: true,
+      });
+
+      expect(activity.channelData?.feedbackLoop).toEqual({ type: 'custom' });
+      expect(activity.channelData?.feedbackLoopEnabled).toBeUndefined();
+    });
+  });
+
   describe('addFeedback', () => {
-    it('should add', () => {
+    it('should add default feedback loop', () => {
       const activity = new Activity({ type: 'test' }).addFeedback();
 
       expect(activity.type).toEqual('test');
-      expect(activity.channelData?.feedbackLoopEnabled).toEqual(true);
+      expect(activity.channelData?.feedbackLoop).toEqual({ type: 'default' });
+      expect(activity.channelData?.feedbackLoopEnabled).toBeUndefined();
+    });
+
+    it('should add custom feedback loop', () => {
+      const activity = new Activity({ type: 'test' }).addFeedback('custom');
+
+      expect(activity.type).toEqual('test');
+      expect(activity.channelData?.feedbackLoop).toEqual({ type: 'custom' });
+      expect(activity.channelData?.feedbackLoopEnabled).toBeUndefined();
     });
   });
 
@@ -211,6 +238,45 @@ describe('Activity', () => {
           ],
         },
       ]);
+    });
+  });
+
+  describe('addTargetedMessageInfo', () => {
+    it('should strip quotedReply entities', () => {
+      const activity = new MessageActivity('hello')
+        .addEntity({ type: 'quotedReply', quotedReply: { messageId: '123' } })
+        .addEntity({ type: 'mention', text: '<at>bot</at>', mentioned: bot })
+        .addTargetedMessageInfo('123');
+
+      expect(activity.entities).toEqual([
+        { type: 'mention', text: '<at>bot</at>', mentioned: bot },
+        { type: 'targetedMessageInfo', messageId: '123' },
+      ]);
+    });
+
+    it('should strip quoted placeholder from text', () => {
+      const activity = new MessageActivity('hello <quoted messageId="123"/>')
+        .addTargetedMessageInfo('123');
+
+      expect(activity.text).toEqual('hello');
+    });
+
+    it('should not add duplicate targetedMessageInfo', () => {
+      const activity = new MessageActivity('hello')
+        .addTargetedMessageInfo('123')
+        .addTargetedMessageInfo('456');
+
+      expect(activity.entities?.filter((e) => e.type === 'targetedMessageInfo')).toHaveLength(1);
+    });
+
+    it('should strip quotedReply even when targetedMessageInfo already present', () => {
+      const activity = new MessageActivity('hello')
+        .addTargetedMessageInfo('123')
+        .addEntity({ type: 'quotedReply', quotedReply: { messageId: '123' } })
+        .addTargetedMessageInfo('123');
+
+      expect(activity.entities?.some((e) => e.type === 'quotedReply')).toBe(false);
+      expect(activity.entities?.filter((e) => e.type === 'targetedMessageInfo')).toHaveLength(1);
     });
   });
 });

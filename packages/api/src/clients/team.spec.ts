@@ -1,4 +1,4 @@
-import { Client } from '@microsoft/teams.common/http';
+import { Client } from '@microsoft/teams.common';
 
 import { TeamClient } from './team';
 
@@ -27,7 +27,9 @@ describe('TeamClient', () => {
 
   it('should get conversations', async () => {
     const client = new TeamClient('');
-    const spy = jest.spyOn(client.http, 'get').mockResolvedValueOnce({});
+    const spy = jest
+      .spyOn(client.http, 'get')
+      .mockResolvedValueOnce({ data: { conversations: [] } });
     await client.getConversations('1');
     expect(spy).toHaveBeenCalledWith('/v3/teams/1/conversations');
   });

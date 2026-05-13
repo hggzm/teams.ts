@@ -1,7 +1,10 @@
-import { Client, ClientOptions } from '@microsoft/teams.common/http';
+import {
+  Client as HttpClient,
+  type ClientOptions as HttpClientOptions
+} from '@microsoft/teams.common';
 
 import { Activity } from '../../activities';
-import { Account, Resource } from '../../models';
+import { resolveAadObjectId, Resource, TeamsChannelAccount } from '../../models';
 import { ApiClientSettings, mergeApiClientSettings } from '../api-client-settings';
 
 export type ActivityParams = Pick<Activity, 'type'> & Partial<Activity>;
@@ -15,18 +18,18 @@ export class ConversationActivityClient {
   set http(v) {
     this._http = v;
   }
-  protected _http: Client;
+  protected _http: HttpClient;
   protected _apiClientSettings: Partial<ApiClientSettings>;
 
-  constructor(serviceUrl: string, options?: Client | ClientOptions, apiClientSettings?: Partial<ApiClientSettings>) {
+  constructor(serviceUrl: string, options?: HttpClient | HttpClientOptions, apiClientSettings?: Partial<ApiClientSettings>) {
     this.serviceUrl = serviceUrl;
 
     if (!options) {
-      this._http = new Client();
+      this._http = new HttpClient();
     } else if ('request' in options) {
       this._http = options;
     } else {
-      this._http = new Client(options);
+      this._http = new HttpClient(options);
     }
 
     this._apiClientSettings = mergeApiClientSettings(apiClientSettings);
@@ -64,9 +67,32 @@ export class ConversationActivityClient {
     return res.data;
   }
 
-  async getMembers(conversationId: string, id: string) {
-    const res = await this.http.get<Account[]>(
+  async getMembers(conversationId: string, id: string): Promise<TeamsChannelAccount[]> {
+    const res = await this.http.get<TeamsChannelAccount[]>(
       `${this.serviceUrl}/v3/conversations/${conversationId}/activities/${id}/members`
+    );
+    return (res.data ?? []).map(resolveAadObjectId);
+  }
+
+  async createTargeted(conversationId: string, params: ActivityParams) {
+    const res = await this.http.post<Resource>(
+      `${this.serviceUrl}/v3/conversations/${conversationId}/activities?isTargetedActivity=true`,
+      params
+    );
+    return res.data;
+  }
+
+  async updateTargeted(conversationId: string, id: string, params: ActivityParams) {
+    const res = await this.http.put<Resource>(
+      `${this.serviceUrl}/v3/conversations/${conversationId}/activities/${id}?isTargetedActivity=true`,
+      params
+    );
+    return res.data;
+  }
+
+  async deleteTargeted(conversationId: string, id: string) {
+    const res = await this.http.delete<void>(
+      `${this.serviceUrl}/v3/conversations/${conversationId}/activities/${id}?isTargetedActivity=true`
     );
     return res.data;
   }

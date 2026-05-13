@@ -4,19 +4,28 @@ import {
   ActivityLike,
   ApiClientSettings,
   ChannelID,
+  CloudEnvironment,
   ConversationReference,
+  cloudFromName,
   InvokeResponse,
+  PUBLIC,
   StripMentionsTextOptions,
   toActivityParams,
   TokenCredentials,
 } from '@microsoft/teams.api';
-import { EventEmitter } from '@microsoft/teams.common/events';
-import * as http from '@microsoft/teams.common/http';
-import { ConsoleLogger, ILogger } from '@microsoft/teams.common/logging';
-import { IStorage, LocalStorage } from '@microsoft/teams.common/storage';
+import {
+  Client as HttpClient,
+  type ClientOptions as HttpClientOptions,
+  ConsoleLogger,
+  EventEmitter,
+  ILogger,
+  IStorage,
+  LocalStorage
+} from '@microsoft/teams.common';
 
 import pkg from '../package.json';
 
+import { ActivitySender } from './activity-sender';
 import { ApiClient, GraphClient } from './api';
 
 import { configTab, func, tab } from './app.embed';
@@ -27,22 +36,26 @@ import {
   onError,
 } from './app.events';
 import {
+  onSignInFailure,
   onTokenExchange,
-  onVerifyState
+  onVerifyState,
 } from './app.oauth';
 import { getMetadata, getPlugin, inject, plugin } from './app.plugins';
 import { $process } from './app.process';
 import { message, on, use } from './app.routing';
 import { Container } from './container';
 import { IActivityEvent } from './events';
+import { ExpressAdapter, IHttpServerAdapter } from './http';
+import { HttpServer } from './http/http-server';
 import * as manifest from './manifest';
 import * as middleware from './middleware';
 import { DEFAULT_OAUTH_SETTINGS, OAuthSettings } from './oauth';
 import { HttpPlugin } from './plugins';
 import { Router } from './router';
 import { TokenManager } from './token-manager';
-import { IPlugin, AppEvents, ISender } from './types';
+import { IPlugin, AppEvents } from './types';
 import { PluginAdditionalContext } from './types/app-routing';
+import { toThreadedConversationId } from './utils/thread';
 
 /**
  * App initialization options
@@ -61,6 +74,12 @@ export type AppOptions<TPlugin extends IPlugin> = {
    * If not available, uses ManagedIdentity to authenticate
    */
   readonly clientSecret?: string;
+
+  /**
+   * Application ID URI from the Azure portal. Used for user authentication.
+   * Matches webApplicationInfo.resource in the app manifest.
+   */
+  readonly applicationIdUri?: string;
 
   /**
    * tenantId - The tenantId where your app is registered
@@ -89,7 +108,7 @@ export type AppOptions<TPlugin extends IPlugin> = {
   /**
    * http client or client options used to make api requests
    */
-  readonly client?: http.Client | http.ClientOptions | (() => http.Client);
+  readonly client?: HttpClient | HttpClientOptions | (() => HttpClient);
 
   /**
    * logger instance to use
@@ -105,6 +124,11 @@ export type AppOptions<TPlugin extends IPlugin> = {
    * plugins to extend the apps functionality
    */
   readonly plugins?: Array<TPlugin>;
+
+  /**
+   * HTTP server adapter for handling bot requests
+   */
+  readonly httpServerAdapter?: IHttpServerAdapter;
 
   /**
    * OAuth Settings
@@ -127,9 +151,30 @@ export type AppOptions<TPlugin extends IPlugin> = {
   readonly skipAuth?: boolean;
 
   /**
+   * URL path for the Teams messaging endpoint
+   * @default '/api/messages'
+   */
+  readonly messagingEndpoint?: `/${string}`;
+
+  /**
+   * Base Service URL for BotBackend
+   * Uses environment variable SERVICE_URL  if not provided
+   * and defaults to https://smba.trafficmanager.net/teams
+   */
+  readonly serviceUrl?: string;
+
+  /**
    * API client settings used for overriding.
    */
-  readonly apiClientSettings?: ApiClientSettings
+  readonly apiClientSettings?: ApiClientSettings;
+
+  /**
+   * Cloud environment for sovereign cloud support.
+   * Accepts a CloudEnvironment object or uses CLOUD environment variable.
+   * Valid env var values: "Public", "USGov", "USGovDoD", "China".
+   * Defaults to PUBLIC (commercial cloud).
+   */
+  readonly cloud?: CloudEnvironment;
 };
 
 export type AppActivityOptions = {
@@ -147,13 +192,23 @@ export type AppActivityOptions = {
  */
 export class App<TPlugin extends IPlugin = IPlugin> {
   readonly api: ApiClient;
+  readonly cloud: CloudEnvironment;
   readonly graph: GraphClient;
   readonly log: ILogger;
-  readonly http: HttpPlugin;
-  readonly client: http.Client;
+  readonly server: HttpServer;
+  readonly http?: HttpPlugin;
+  readonly client: HttpClient;
   readonly storage: IStorage;
   readonly entraTokenValidator?: middleware.JwtValidator;
   readonly tokenManager: TokenManager;
+
+  /**
+   * Graph API base URL derived from the configured cloud's `graphScope`.
+   * Undefined when the scope isn't a URL — `GraphClient` then uses its public-cloud default.
+   * Shared across every `GraphClient` the app constructs (`app.graph`, `ctx.appGraph`, `ctx.userGraph`)
+   * so sovereign customers get consistent routing.
+   */
+  readonly graphBaseUrl?: string;
 
   /**
    * the apps credentials
@@ -216,8 +271,9 @@ export class App<TPlugin extends IPlugin = IPlugin> {
   protected router = new Router<PluginAdditionalContext<TPlugin>>();
   protected tenantTokens = new LocalStorage<string>({}, { max: 20000 });
   protected events = new EventEmitter<AppEvents<TPlugin>>();
-  protected startedAt?: Date;
+  protected isInitialized = false;
   protected port?: number | string;
+  protected activitySender: ActivitySender;
 
   private readonly _userAgent = `teams.ts[apps]/${pkg.version}`;
 
@@ -225,8 +281,13 @@ export class App<TPlugin extends IPlugin = IPlugin> {
     this.log = this.options.logger || new ConsoleLogger('@teams/app');
     this.storage = this.options.storage || new LocalStorage();
     this._manifest = this.options.manifest || {};
+
+    // Resolve cloud environment from options or CLOUD env var
+    const cloudEnvName = typeof process !== 'undefined' ? process.env.CLOUD : undefined;
+    this.cloud = this.options.cloud ?? (cloudEnvName ? cloudFromName(cloudEnvName) : PUBLIC);
+
     if (!options.client) {
-      this.client = new http.Client({
+      this.client = new HttpClient({
         headers: {
           'User-Agent': this._userAgent,
         },
@@ -244,7 +305,7 @@ export class App<TPlugin extends IPlugin = IPlugin> {
         },
       });
     } else {
-      this.client = new http.Client({
+      this.client = new HttpClient({
         ...options.client,
         headers: {
           ...options.client.headers,
@@ -253,14 +314,29 @@ export class App<TPlugin extends IPlugin = IPlugin> {
       });
     }
 
+    const serviceUrl = (this.options.serviceUrl ?? process.env.SERVICE_URL ??
+      'https://smba.trafficmanager.net/teams').replace(/\/+$/, '');
     this.api = new ApiClient(
-      'https://smba.trafficmanager.net/teams',
+      serviceUrl,
       this.client.clone({ token: () => this.getBotToken() }),
-      this.options.apiClientSettings
+      this.options.apiClientSettings,
+      this.cloud
     );
 
+    // Derive Graph API base URL from the cloud's graphScope (e.g. "https://graph.microsoft.us/.default"
+    // -> "https://graph.microsoft.us"). Falls back to the public Graph endpoint inside GraphClient if
+    // the scope isn't a URL (custom delegated scope, empty, etc.).
+    const graphUrlMatch = /^(https?:\/\/[^/]+)/i.exec((this.cloud.graphScope ?? '').trim());
+    this.graphBaseUrl = graphUrlMatch?.[1];
+    if (!this.graphBaseUrl && this.cloud.graphScope) {
+      this.log.warn(
+        `graphScope "${this.cloud.graphScope}" is not a URL; Graph calls will route to the public cloud. ` +
+        'Set graphScope to an "https://<host>/.default" value to route to the correct Graph endpoint.'
+      );
+    }
     this.graph = new GraphClient(
-      this.client.clone({ token: () => this.getAppGraphToken() })
+      this.client.clone({ token: () => this.getAppGraphToken() }),
+      { baseUrlRoot: this.graphBaseUrl }
     );
 
     // initialize TokenManager with credentials
@@ -270,33 +346,68 @@ export class App<TPlugin extends IPlugin = IPlugin> {
       tenantId: this.options.tenantId,
       token: this.options.token,
       managedIdentityClientId: this.options.managedIdentityClientId,
+      cloud: this.cloud,
     }, this.log);
+
+    // initialize ActivitySender for sending activities
+    this.activitySender = new ActivitySender(
+      this.client.clone({ token: () => this.getBotToken() }),
+      this.log
+    );
 
     if (this.credentials?.clientId) {
       this.entraTokenValidator = middleware.createEntraTokenValidator(
         this.credentials.tenantId || 'common',
         this.credentials.clientId,
-        { logger: this.log, }
+        { applicationIdUri: this.options.applicationIdUri, loginEndpoint: this.cloud.loginEndpoint, logger: this.log }
       );
     }
 
-    // add/validate plugins
+    // Determine HTTP server
     const plugins: Array<TPlugin> = this.options.plugins || [];
-    let httpPlugin = plugins.find((p) => {
+    const httpPlugin = plugins.find((p) => {
       const meta = getMetadata(p);
       return meta.name === 'http';
     }) as HttpPlugin | undefined;
 
-    if (!httpPlugin) {
-      httpPlugin = new HttpPlugin(undefined, { skipAuth: this.options.skipAuth });
-      // Casting to any here because a default HttpPlugin is not assignable to TPlugin
-      // without a silly level of indirection.
-      plugins.unshift(httpPlugin as any);
-    } else if (this.options.skipAuth) {
-      this.log.warn('skipAuth option has no effect when a custom HTTP plugin is provided. Configure authentication on the plugin directly.');
+    // Error if both httpServerAdapter and http plugin are provided
+    if (this.options.httpServerAdapter && httpPlugin) {
+      throw new Error(
+        'Cannot provide both httpServerAdapter option and HttpPlugin in plugins array. ' +
+        'Use either:\n' +
+        '  - new App({ httpServerAdapter: new ExpressAdapter() }) (recommended)\n' +
+        '  - new App({ plugins: [new HttpPlugin()] }) (deprecated)'
+      );
     }
 
-    this.http = httpPlugin;
+    let server: HttpServer;
+
+    // HttpPlugin in plugins array (backwards compatibility)
+    if (httpPlugin) {
+      this.log.warn('[DEPRECATED] HttpPlugin in plugins array will be deprecated. Use httpServerAdapter option instead:\n' +
+        '  new App({ httpServerAdapter: new ExpressAdapter() })');
+      this.http = httpPlugin;
+      // Extract internal server and always set this.server
+      server = (httpPlugin as any).asServer?.();
+      if (!server) {
+        throw new Error('HttpPlugin.asServer() returned undefined');
+      }
+    } else {
+      server = new HttpServer(this.options.httpServerAdapter ?? new ExpressAdapter(undefined, {
+        logger: this.log,
+        onError: (err) => this.onError({ error: err })
+      }), {
+        skipAuth: this.options.skipAuth,
+        logger: this.log,
+        messagingEndpoint: this.options.messagingEndpoint ?? '/api/messages',
+      });
+    }
+
+    // Always set this.server
+    this.server = server;
+
+    // Set callback for handling activities
+    server.onRequest = (event) => this.onActivity(event);
 
     // add injectable items to container
     this.container.register('id', { useValue: this.id });
@@ -310,6 +421,10 @@ export class App<TPlugin extends IPlugin = IPlugin> {
       useFactory: () => this.client,
     });
 
+    // Register HTTP server for plugins that need HTTP capabilities
+    this.container.register('IHttpServer', { useValue: server });
+
+    // Register all plugins (including HttpPlugin if using old way)
     for (const plugin of plugins) {
       this.plugin(plugin);
     }
@@ -338,6 +453,13 @@ export class App<TPlugin extends IPlugin = IPlugin> {
       callback: ctx => this.onVerifyState(ctx),
     });
 
+    this.router.register({
+      name: 'signin.failure',
+      type: 'system',
+      select: activity => activity.type === 'invoke' && activity.name === 'signin/failure',
+      callback: ctx => this.onSignInFailure(ctx),
+    });
+
     this.event('error', ({ error }) => {
       this.log.error(error.message);
 
@@ -349,33 +471,53 @@ export class App<TPlugin extends IPlugin = IPlugin> {
   }
 
   /**
-   * start the app
+   * initialize the app.
+   */
+  async initialize() {
+    if (this.isInitialized) {
+      return;
+    }
+
+    // initialize plugins
+    for (const plugin of this.plugins) {
+      this.inject(plugin);
+
+      if (plugin.onInit) {
+        await plugin.onInit();
+      }
+    }
+
+    // initialize server
+    await this.server.initialize({
+      credentials: this.credentials,
+      cloud: this.cloud,
+    });
+
+    this.isInitialized = true;
+  }
+
+  /**
+   * start the server after initialization
    * @param port port to listen on
    */
   async start(port?: number | string) {
     this.port = port || process.env.PORT || 3978;
 
     try {
-      // initialize plugins
-      for (const plugin of this.plugins) {
-        // inject dependencies
-        this.inject(plugin);
+      await this.initialize();
 
-        if (plugin.onInit) {
-          plugin.onInit();
-        }
-      }
-
-      // start plugins
+      // Start plugins
       for (const plugin of this.plugins) {
         if (plugin.onStart) {
           await plugin.onStart({ port: this.port });
         }
       }
-
       this.events.emit('start', this.log);
-      this.startedAt = new Date();
+
+      // Start HTTP server
+      await this.server.start(this.port);
     } catch (error: any) {
+      await this.stop();
       this.onError({ error });
     }
   }
@@ -385,25 +527,36 @@ export class App<TPlugin extends IPlugin = IPlugin> {
    */
   async stop() {
     try {
+      // Stop plugins
       for (const plugin of this.plugins) {
         if (plugin.onStop) {
           await plugin.onStop();
         }
       }
+
+      // Stop HTTP server
+      await this.server.stop();
     } catch (error: any) {
       this.onError({ error });
     }
   }
 
   /**
-   * send an activity proactively
+   * send an activity proactively to a conversation.
+   *
+   * Sends to the exact conversation ID provided. For channel threads,
+   * the conversation ID must include `;messageid=` - use {@link toThreadedConversationId}
+   * to construct it, or use {@link reply} which handles this automatically.
+   *
    * @param conversationId the conversation to send to
    * @param activity the activity to send
    */
   async send(conversationId: string, activity: ActivityLike) {
     if (!this.id) {
-      throw new Error('app not started');
+      throw new Error('App has no credentials set up');
     }
+
+    const params = toActivityParams(activity);
 
     const ref: ConversationReference = {
       channelId: 'msteams',
@@ -415,12 +568,42 @@ export class App<TPlugin extends IPlugin = IPlugin> {
       },
       conversation: {
         id: conversationId,
-        conversationType: 'personal',
-      },
+      } as ConversationReference['conversation'],
     };
 
-    const res = await this.http.send(toActivityParams(activity), ref);
+    const res = await this.activitySender.send(params, ref);
     return res;
+  }
+
+  /**
+   * send an activity proactively as a threaded reply.
+   *
+   * Constructs a threaded conversation ID from the conversation ID
+   * and message ID via {@link toThreadedConversationId}, then sends
+   * to that thread. The service determines whether threading is
+   * supported for the given conversation type.
+   *
+   * @param conversationId the conversation ID
+   * @param messageId the thread root message ID
+   * @param activity the activity to send
+   */
+  async reply(conversationId: string, messageId: string, activity: ActivityLike): Promise<any>;
+  /**
+   * send an activity proactively to a conversation.
+   *
+   * Sends to the exact conversation ID provided - threaded if
+   * it contains `;messageid=`, flat otherwise.
+   *
+   * @param conversationId the conversation to send to
+   * @param activity the activity to send
+   */
+  async reply(conversationId: string, activity: ActivityLike): Promise<any>;
+  async reply(conversationId: string, messageId: string | ActivityLike, activity?: ActivityLike) {
+    if (typeof messageId === 'string' && activity !== undefined) {
+      return this.send(toThreadedConversationId(conversationId, messageId), activity);
+    }
+
+    return this.send(conversationId, messageId as ActivityLike);
   }
 
   /**
@@ -498,6 +681,7 @@ export class App<TPlugin extends IPlugin = IPlugin> {
 
   protected onTokenExchange = onTokenExchange; // eslint-disable-line @typescript-eslint/member-ordering
   protected onVerifyState = onVerifyState; // eslint-disable-line @typescript-eslint/member-ordering
+  protected onSignInFailure = onSignInFailure; // eslint-disable-line @typescript-eslint/member-ordering
 
   ///
   /// Events
@@ -509,11 +693,10 @@ export class App<TPlugin extends IPlugin = IPlugin> {
   protected onActivityResponse = onActivityResponse; // eslint-disable-line @typescript-eslint/member-ordering
 
   async onActivity(
-    sender: ISender,
     event: IActivityEvent
   ): Promise<InvokeResponse> {
     this.events.emit('activity', event);
-    return await this.process(sender, { ...event, sender });
+    return await this.process(event);
   }
 
   ///

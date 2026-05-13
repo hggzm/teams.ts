@@ -5,6 +5,7 @@ import {
   ConversationAccount,
   ConversationReference,
   InvokeResponse,
+  IMessageActivity,
   MessageActivity,
   MessageDeleteActivity,
   MessageUpdateActivity,
@@ -15,13 +16,35 @@ import {
   TokenPostResource,
   TypingActivity,
 } from '@microsoft/teams.api';
-import { ILogger } from '@microsoft/teams.common/logging';
-import { IStorage } from '@microsoft/teams.common/storage';
+import { ILogger, IStorage } from '@microsoft/teams.common';
 
 import { ApiClient, GraphClient } from '../api';
-import { ISender, IStreamer } from '../types';
+import { IStreamer } from '../types';
+import { IActivitySender } from '../types/plugin/sender';
 
-export interface IBaseActivityContextOptions<T extends Activity = Activity, TExtraCtx extends Record<string, any> = Record<string, any>> {
+/**
+ * Constructor arguments for ActivityContext
+ * Internal implementation details not exposed in public interface
+ */
+export interface IActivityContextConstructorArgs {
+  /**
+   * activity sender for sending activities and creating streams
+   */
+  activitySender: IActivitySender;
+
+  /**
+   * call the next event/middleware handler
+   */
+  next: (
+    context?: IActivityContext
+  ) => (void | InvokeResponse) | Promise<void | InvokeResponse>;
+}
+
+/**
+ * Base activity context options
+ * These are the public properties exposed on the context
+ */
+export interface IBaseActivityContextOptions<T extends Activity = Activity> {
   /**
    * the app id of the bot
    */
@@ -79,21 +102,9 @@ export interface IBaseActivityContextOptions<T extends Activity = Activity, TExt
    * the user token for the activity context
    */
   userToken?: string;
-
-  /**
-   * extra data
-   */
-  [key: string]: any;
-
-  /**
-   * call the next event/middleware handler
-   */
-  next: (
-    context?: IActivityContext & TExtraCtx
-  ) => (void | InvokeResponse) | Promise<void | InvokeResponse>;
 }
 
-export type IActivityContextOptions<T extends Activity = Activity, TExtraCtx extends Record<string, any> = Record<string, any>> = IBaseActivityContextOptions<T, TExtraCtx> & TExtraCtx;
+export type IActivityContextOptions<T extends Activity = Activity, TExtraCtx extends Record<string, any> = Record<string, any>> = IBaseActivityContextOptions<T> & TExtraCtx;
 
 type SignInOptions = {
   /**
@@ -131,11 +142,18 @@ type SignInOptions = {
 };
 
 export interface IBaseActivityContext<T extends Activity = Activity, TExtraCtx extends Record<string, any> = Record<string, any>>
-  extends IBaseActivityContextOptions<T, TExtraCtx> {
+  extends IBaseActivityContextOptions<T> {
   /**
    * a stream that can emit activity chunks
    */
   stream: IStreamer;
+
+  /**
+   * call the next event/middleware handler
+   */
+  next: (
+    context?: IActivityContext & TExtraCtx
+  ) => (void | InvokeResponse) | Promise<void | InvokeResponse>;
 
   /**
    * send an activity to the conversation
@@ -145,10 +163,20 @@ export interface IBaseActivityContext<T extends Activity = Activity, TExtraCtx e
   send: (activity: ActivityLike, conversationRef?: ConversationReference) => Promise<SentActivity>;
 
   /**
-   * reply to the inbound activity
+   * reply to the inbound activity, automatically quoting the inbound message
    * @param activity activity to send
    */
   reply: (activity: ActivityLike) => Promise<SentActivity>;
+
+  /**
+   * send a reply quoting a specific message by ID
+   * @param messageId the ID of the message to quote
+   * @param activity activity to send
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsQuotedReplies
+   */
+  quote: (messageId: string, activity: ActivityLike) => Promise<SentActivity>;
 
   /**
    * trigger user signin flow for the activity sender
@@ -176,7 +204,7 @@ export class ActivityContext<T extends Activity = Activity, TExtraCtx extends {}
   appGraph!: GraphClient;
   userGraph!: GraphClient;
   storage!: IStorage;
-  stream: IStreamer;
+  stream!: IStreamer;
   isSignedIn?: boolean;
   connectionName: string;
   next!: (
@@ -184,48 +212,118 @@ export class ActivityContext<T extends Activity = Activity, TExtraCtx extends {}
   ) => (void | InvokeResponse) | Promise<void | InvokeResponse>;
   [key: string]: any;
 
-  protected _plugin: ISender;
-  protected _next?: (
-    context?: IActivityContext
-  ) => (void | InvokeResponse) | Promise<void | InvokeResponse>;
+  private activitySender: IActivitySender;
 
-  constructor(plugin: ISender, value: IBaseActivityContextOptions) {
-    Object.assign(this, value);
-    this._plugin = plugin;
-    this.stream = plugin.createStream(value.ref);
+  constructor(value: IBaseActivityContextOptions & IActivityContextConstructorArgs) {
+    // Extract activitySender and next before Object.assign to avoid overwriting methods
+    const { activitySender, next, ...rest } = value;
+
+    if (rest.activity.type === 'message') {
+      rest.activity = MessageActivity.from(rest.activity).toInterface();
+    }
+
+    if (rest.activity.type === 'messageUpdate') {
+      rest.activity = MessageUpdateActivity.from(rest.activity).toInterface();
+    }
+
+    if (rest.activity.type === 'messageDelete') {
+      rest.activity = MessageDeleteActivity.from(rest.activity).toInterface();
+    }
+
+    if (rest.activity.type === 'typing') {
+      rest.activity = TypingActivity.from(rest.activity).toInterface();
+    }
+
+    Object.assign(this, rest);
+    this.activitySender = activitySender;
+    this.next = next;
+    this.stream = activitySender.createStream(value.ref);
     this.connectionName = value.connectionName;
-
-    if (value.activity.type === 'message') {
-      value.activity = MessageActivity.from(value.activity).toInterface();
-    }
-
-    if (value.activity.type === 'messageUpdate') {
-      value.activity = MessageUpdateActivity.from(value.activity).toInterface();
-    }
-
-    if (value.activity.type === 'messageDelete') {
-      value.activity = MessageDeleteActivity.from(value.activity).toInterface();
-    }
-
-    if (value.activity.type === 'typing') {
-      value.activity = TypingActivity.from(value.activity).toInterface();
-    }
   }
 
+  /**
+   * send an activity in the current conversation without quoting.
+   *
+   * In channels, sends to the current thread. In scopes that do not
+   * support threading (group chat, meetings), sends as a normal message.
+   * To send with a visual quote of the inbound message, use {@link reply}.
+   *
+   * @param activity the activity to send
+   * @param conversationRef optional conversation reference to send to a different conversation or thread
+   */
   async send(activity: ActivityLike, conversationRef?: ConversationReference) {
-    return await this._plugin.send(toActivityParams(activity), conversationRef ?? this.ref);
+    const params = toActivityParams(activity);
+
+    // For targeted send, set the recipient if not already set.
+    // For targeted update (params.id exists), we don't update recipient since recipient cannot be changed.
+    if (params.type === 'message' && params.recipient?.isTargeted && !params.id) {
+      if (!params.recipient) {
+        params.recipient = this.activity.from;
+      }
+    }
+
+    // Auto-populate targetedMessageInfo entity for prompt preview
+    // when replying to a targeted message in the reactive flow.
+    if (
+      params.type === 'message' &&
+      this.activity.recipient?.isTargeted === true
+    ) {
+      if (params.entities) {
+        params.entities = params.entities.filter((e) => e.type !== 'quotedReply');
+      }
+
+      if (params.text) {
+        params.text = params.text.replace(`<quoted messageId="${this.activity.id}"/>`, '').trim();
+      }
+
+      if (!params.entities?.some((e) => e.type === 'targetedMessageInfo')) {
+        if (!params.entities) {
+          params.entities = [];
+        }
+
+        params.entities.push({
+          type: 'targetedMessageInfo',
+          messageId: this.activity.id,
+        });
+      }
+    }
+
+    return await this.activitySender.send(params, conversationRef ?? this.ref);
   }
 
+  /**
+   * send an activity in the current conversation with a visual quote
+   * of the inbound message.
+   *
+   * In channels, sends to the current thread with a quoted reply.
+   * In other scopes, sends with a quoted reply.
+   * To send without quoting, use {@link send}.
+   *
+   * @param activity the activity to send
+   */
   async reply(activity: ActivityLike) {
+    if (this.activity.id) {
+      return this.quote(this.activity.id, activity);
+    }
+    return this.send(activity);
+  }
+
+  /**
+   * Send a message to the conversation with a quoted message reference prepended to the text.
+   * Teams renders the quoted message as a preview bubble above the response text.
+   * @param messageId - The ID of the message to quote
+   * @param activity - The activity to send — a quote placeholder for messageId will be prepended to its text
+   *
+   * @experimental This API is coming soon and may change in the future.
+   * Diagnostic: ExperimentalTeamsQuotedReplies
+   */
+  async quote(messageId: string, activity: ActivityLike) {
     activity = toActivityParams(activity);
-    activity.replyToId = this.activity.id;
 
-    if (activity.type === 'message' && activity.text) {
-      const blockQuote = this.buildBlockQuoteForActivity();
-
-      if (blockQuote) {
-        activity.text = `${blockQuote}\r\n${activity.text}`;
-      }
+    if (activity.type === 'message') {
+      const message = MessageActivity.from(activity as IMessageActivity);
+      message.prependQuote(messageId);
+      return this.send(message);
     }
 
     return this.send(activity);
@@ -270,8 +368,6 @@ export class ActivityContext<T extends Activity = Activity, TExtraCtx extends {}
       // because groupchats don't support it.
       const res = await this.api.conversations.create({
         tenantId: this.activity.conversation.tenantId,
-        isGroup: false,
-        bot: { id: this.activity.recipient.id },
         members: [this.activity.from],
       });
 
@@ -337,28 +433,11 @@ export class ActivityContext<T extends Activity = Activity, TExtraCtx extends {}
       userToken: this.userToken,
       next: this.next.bind(this),
       reply: this.reply.bind(this),
+      quote: this.quote.bind(this),
       send: this.send.bind(this),
       signin: this.signin.bind(this),
       signout: this.signout.bind(this),
     };
   }
 
-  private buildBlockQuoteForActivity(): string | null {
-    if (this.activity.type === 'message' && this.activity.text) {
-      const maxLength = 120;
-      const truncatedText =
-        this.activity.text.length > maxLength
-          ? `${this.activity.text.substring(0, maxLength)}...`
-          : this.activity.text;
-
-      return `<blockquote itemscope="" itemtype="http://schema.skype.com/Reply" itemid="${this.activity.id}">
-<strong itemprop="mri" itemid="${this.activity.from.id}">${this.activity.from.name}</strong><span itemprop="time" itemid="${this.activity.id}"></span>
-<p itemprop="preview">${truncatedText}</p>
-</blockquote>`;
-    } else {
-      this.log.debug('Skipping building blockquote for activity type:', this.activity.type);
-    }
-
-    return null;
-  }
 }

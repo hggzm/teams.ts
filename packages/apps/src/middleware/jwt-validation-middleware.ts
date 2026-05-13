@@ -1,13 +1,14 @@
 import express from 'express';
 
-import { Activity, Credentials, IToken, JsonWebToken } from '@microsoft/teams.api';
+import { Activity, CloudEnvironment, Credentials, IToken } from '@microsoft/teams.api';
 import { ConsoleLogger, ILogger } from '@microsoft/teams.common';
 
-import { createServiceTokenValidator, JwtValidator } from './auth/jwt-validator';
+import { ServiceTokenValidator } from './auth/service-token-validator';
 
 export type JwtValidationParams = {
   credentials?: Credentials;
   logger: ILogger;
+  cloud?: CloudEnvironment;
 };
 
 export type JwtValidatedRequest = express.Request & {
@@ -15,21 +16,22 @@ export type JwtValidatedRequest = express.Request & {
 };
 
 export function withJwtValidation(params: JwtValidationParams) {
-  const { credentials, logger: inputLogger } = params;
+  const { credentials, logger: inputLogger, cloud } = params;
   const logger = inputLogger?.child('jwt-validation-middleware') ?? new ConsoleLogger('jwt-validation-middleware');
 
   // Create service token validator if credentials are provided
-  let serviceTokenValidator: JwtValidator | null;
+  let validator: ServiceTokenValidator | null;
   if (credentials?.clientId) {
-    serviceTokenValidator = createServiceTokenValidator(
+    validator = new ServiceTokenValidator(
       credentials.clientId,
       credentials.tenantId,
       undefined,
-      logger
+      logger,
+      cloud
     );
   } else {
     logger.debug('No credentials provided, skipping service token validation');
-    serviceTokenValidator = null;
+    validator = null;
   }
 
   return async (
@@ -37,31 +39,28 @@ export function withJwtValidation(params: JwtValidationParams) {
     res: express.Response,
     next: express.NextFunction
   ) => {
-    if (!serviceTokenValidator) {
+    if (!validator) {
       logger.debug('No service token validator configured, skipping validation');
       next();
       return;
     }
 
-    const authorization = req.headers.authorization?.replace('Bearer ', '');
-    if (!authorization) {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
       res.status(401).send('unauthorized');
       return;
     }
 
-
     const activity: Activity = req.body;
-    // Use cached validator with per-request service URL validation
-    const validationResult = await serviceTokenValidator.validateAccessToken(authorization, activity.serviceUrl ? {
-      validateServiceUrl: { expectedServiceUrl: activity.serviceUrl }
-    } : undefined);
 
-    if (validationResult) {
+    try {
+      const token = await validator.check(authHeader, activity);
       logger.debug(`validated service token for activity ${activity.id}`);
       // Store the validated token in the request for use in subsequent handlers
-      req.validatedToken = new JsonWebToken(authorization);
+      req.validatedToken = token;
       next();
-    } else {
+    } catch (err) {
+      logger.error('Token validation failed:', err);
       res.status(401).send('Invalid token');
     }
   };

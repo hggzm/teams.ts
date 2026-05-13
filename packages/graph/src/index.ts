@@ -1,4 +1,7 @@
-import * as http from '@microsoft/teams.common/http';
+import {
+  Client as HttpClient,
+  type ClientOptions as HttpClientOptions
+} from '@microsoft/teams.common';
 
 import { getInjectedUrl, getInjectedRequestConfig } from './utils/url';
 
@@ -9,12 +12,52 @@ declare const __PACKAGE_VERSION__: string;
 
 export { CallOptions, EndpointRequest, SchemaVersion } from './types';
 
+/**
+ * Error thrown when a Graph API request fails.
+ * Surfaces the response body from the Graph API for easier debugging.
+ */
+export class GraphError extends Error {
+  /** HTTP status code */
+  readonly statusCode: number;
+  /** Graph API error code (e.g. "Authorization_RequestDenied") */
+  readonly code?: string;
+  /** The full response body from the Graph API */
+  readonly body: unknown;
+  /** The underlying error that caused this GraphError (e.g. the Axios error) */
+  readonly source?: unknown;
+
+  constructor(statusCode: number, body: unknown, method: string, url: string, source?: unknown) {
+    const graphError = body && typeof body === 'object' && 'error' in body
+      ? (body as { error: { code?: string; message?: string } }).error
+      : undefined;
+
+    const message = graphError?.message
+      ? `Graph ${method.toUpperCase()} ${url} failed (${statusCode}): ${graphError.message}`
+      : `Graph ${method.toUpperCase()} ${url} failed with status ${statusCode}`;
+
+    super(message);
+    this.name = 'GraphError';
+    this.statusCode = statusCode;
+    this.code = graphError?.code;
+    Object.defineProperty(this, 'body', { value: body, enumerable: false, writable: true, configurable: true });
+    if (source !== undefined) {
+      Object.defineProperty(this, 'source', { value: source, enumerable: false, writable: true, configurable: true });
+    }
+  }
+}
+
 const defaultBaseUrlRoot = 'https://graph.microsoft.com';
 
-type Options = (http.Client | http.ClientOptions) & {
+type Options = (HttpClient | HttpClientOptions) & {
   /** Graph service root. By default, the global commercial URL "https://graph.microsoft.com" is used,
    * but certain tenants may wish to override this to direct Graph API calls to a different cloud instance.
    */
+  baseUrlRoot?: string;
+};
+
+/** Graph-specific client options. */
+type GraphOptions = {
+  /** Graph service root override for routing Graph calls to sovereign cloud. */
   baseUrlRoot?: string;
 };
 
@@ -24,13 +67,38 @@ type Options = (http.Client | http.ClientOptions) & {
  */
 export class Client {
   protected baseUrlRoot;
-  protected http: http.Client;
-  protected betaHttp?: http.Client;
+  protected _http: HttpClient;
+  protected betaHttp?: HttpClient;
 
-  constructor(options?: Options) {
-    this.baseUrlRoot = options?.baseUrlRoot ?? defaultBaseUrlRoot;
+  /**
+   * The underlying HTTP client, pre-configured with Graph base URL and headers.
+   * Use for raw Graph API requests not covered by endpoint functions.
+   */
+  get http(): HttpClient {
+    return this._http;
+  }
+
+  /**
+   * Creates a Graph client.
+   *
+   * @param options - The HTTP client to use; an existing {@link HttpClient} will be cloned,
+   * or an {@link HttpClientOptions} bag will be used to build a new one.
+   * HTTP-level settings like headers, interceptors, and timeouts belong here.
+   * @param graphOptions - Graph-specific options. Takes precedence over `options.baseUrlRoot`
+   * when both are set.
+   *
+   * @example
+   * // Public cloud (default)
+   * new Client({ token });
+   *
+   * @example
+   * // Sovereign cloud (GCCH)
+   * new Client(httpClient, { baseUrlRoot: 'https://graph.microsoft.us' });
+   */
+  constructor(options?: Options, graphOptions?: GraphOptions) {
+    this.baseUrlRoot = graphOptions?.baseUrlRoot ?? options?.baseUrlRoot ?? defaultBaseUrlRoot;
     if (!options) {
-      this.http = new http.Client({
+      this._http = new HttpClient({
         baseUrl: `${this.baseUrlRoot}/v1.0`,
         headers: {
           'Content-Type': 'application/json',
@@ -38,7 +106,7 @@ export class Client {
         },
       });
     } else if ('request' in options) {
-      this.http = options.clone({
+      this._http = options.clone({
         baseUrl: `${this.baseUrlRoot}/v1.0`,
         headers: {
           'Content-Type': 'application/json',
@@ -46,7 +114,7 @@ export class Client {
         },
       });
     } else {
-      this.http = new http.Client({
+      this._http = new HttpClient({
         ...options,
         baseUrl: `${this.baseUrlRoot}/v1.0`,
         headers: {
@@ -106,27 +174,35 @@ export class Client {
     const requestConfig = getInjectedRequestConfig(paramDefs, params, callOptions?.requestConfig);
     const httpClient = this.getHttpClient(ver);
 
-    switch (method) {
-      case 'delete':
-      case 'get':
-        return (await httpClient[method](url, requestConfig)).data as R;
-      case 'patch':
-      case 'post':
-      case 'put':
-        return (await httpClient[method](url, body, requestConfig)).data as R;
-      default:
-        throw new Error(`Unsupported HTTP method: ${method}`);
+    try {
+      switch (method) {
+        case 'delete':
+        case 'get':
+          return (await httpClient[method](url, requestConfig)).data as R;
+        case 'patch':
+        case 'post':
+        case 'put':
+          return (await httpClient[method](url, body, requestConfig)).data as R;
+        default:
+          throw new Error(`Unsupported HTTP method: ${method}`);
+      }
+    } catch (err) {
+      if (err && typeof err === 'object' && 'isAxiosError' in err && 'response' in err && err.response) {
+        const { response } = err as { response: { status: number; data: unknown } };
+        throw new GraphError(response.status, response.data, method, url, err);
+      }
+      throw err;
     }
   }
 
-  private getHttpClient(schemaVersion: SchemaVersion): http.Client {
+  private getHttpClient(schemaVersion: SchemaVersion): HttpClient {
     if (schemaVersion === 'v1.0') {
-      return this.http;
+      return this._http;
     }
 
     this.betaHttp =
       this.betaHttp ??
-      this.http.clone({
+      this._http.clone({
         baseUrl: `${this.baseUrlRoot}/beta`,
       });
 

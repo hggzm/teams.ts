@@ -13,11 +13,21 @@ export interface IJwtValidationOptions {
   /** Required: Application/Client ID for audience validation */
   clientId: string;
 
+  // Additional audience values to accept beyond the defaults
+  // (clientId, api://clientId, api://botid-clientId)
+  audience?: string[];
+
   /**
    * This may be 'common', 'organizations', 'consumers' for multi-tenant apps,
    * or a specific tenant ID for single-tenant apps.
    */
   tenantId?: string;
+
+  /**
+   * The Azure AD login endpoint. Used for JWKS URI construction and issuer validation.
+   * Defaults to "https://login.microsoftonline.com".
+   */
+  loginEndpoint?: string;
 
   /**
    * JWKS URI options for fetching public keys
@@ -73,7 +83,9 @@ export class JwtValidator {
       const verifyOptions: jwt.VerifyOptions = {
         audience: [
           this.options.clientId,
+          `api://botid-${this.options.clientId}`,
           `api://${this.options.clientId}`,
+          ...(this.options.audience ?? []),
         ],
         issuer: undefined,
         ignoreExpiration: false,
@@ -123,8 +135,9 @@ export class JwtValidator {
             this.logger?.debug(`Using cached JWKS client for tenant ID: ${this.options.tenantId}`);
             return cachedClient;
           }
+          const loginEndpoint = this.options.loginEndpoint ?? 'https://login.microsoftonline.com';
           this.jwksCache.set(`${this.options.tenantId}`, jwksRsa({
-            jwksUri: `https://login.microsoftonline.com/${this.options.tenantId}/discovery/v2.0/keys`,
+            jwksUri: `${loginEndpoint}/${this.options.tenantId}/discovery/v2.0/keys`,
           }));
 
           return this.jwksCache.get(`${this.options.tenantId}`)!;
@@ -162,47 +175,60 @@ export class JwtValidator {
   }
 
   private validateIssuer(iss: string | undefined): void {
-    if (!this.options.validateIssuer) {
-      return; // No issuer validation configured
-    }
-    if (!iss) {
-      throw new Error('Token missing issuer claim');
+    const validateIssuer = this.options.validateIssuer;
+    if (!validateIssuer) {
+      return;
     }
 
-    if ('allowedIssuer' in this.options.validateIssuer) {
-      // Validate against a specific allowed issuer
-      if (iss !== this.options.validateIssuer.allowedIssuer) {
-        throw new Error(`Token issuer '${iss}' does not match allowed issuer '${this.options.validateIssuer.allowedIssuer}'`);
+    // Check for allowedIssuer (exact match validation)
+    if ('allowedIssuer' in validateIssuer) {
+      if (!validateIssuer.allowedIssuer) {
+        return;
       }
-      return;
+      if (!iss) {
+        throw new Error('Token missing issuer claim');
+      }
+      if (iss !== validateIssuer.allowedIssuer) {
+        throw new Error(`Token issuer '${iss}' does not match allowed issuer '${validateIssuer.allowedIssuer}'`);
+      }
     }
 
-    if (!this.options.tenantId) {
-      return;
-    }
+    // Check for allowedTenantIds (tenant-based validation)
+    if ('allowedTenantIds' in validateIssuer) {
+      if (!validateIssuer.allowedTenantIds?.length) {
+        return;
+      }
 
-    const isMultiTenant = ['common', 'organizations', 'consumers'].includes(this.options.tenantId);
-    const allowedTenantIds = [];
-    if (isMultiTenant) {
-      if (this.options.validateIssuer.allowedTenantIds) {
-        // find which tenant ids are not 'common', 'organizations', or 'consumers'
-        for (const tenantId of this.options.validateIssuer.allowedTenantIds) {
+      if (!iss) {
+        throw new Error('Token missing issuer claim');
+      }
+
+      if (!this.options.tenantId) {
+        throw new Error('Tenant ID is required when allowedTenantIds is configured');
+      }
+
+      const isMultiTenant = ['common', 'organizations', 'consumers'].includes(this.options.tenantId);
+      const allowedTenantIds: string[] = [];
+      if (isMultiTenant) {
+        for (const tenantId of validateIssuer.allowedTenantIds) {
           if (!['common', 'organizations', 'consumers'].includes(tenantId)) {
             allowedTenantIds.push(tenantId);
           }
         }
+      } else {
+        // For single-tenant apps, only allow tokens issued by this app's tenant
+        allowedTenantIds.push(this.options.tenantId);
       }
-    } else {
-      // For single-tenant apps, only allow tokens issued by this app's tenant
-      // (ignore allowedTenantIds option for single-tenant apps)
-      allowedTenantIds.push(this.options.tenantId);
-    }
 
-    if (allowedTenantIds.length === 0) {
-      return; // No allowed tenant IDs configured, so no validation needed
-    } else {
-      // Validate against allowed tenant IDs
-      if (!allowedTenantIds.some((tenantId) => iss.startsWith(`https://login.microsoftonline.com/${tenantId}/`))) {
+      if (allowedTenantIds.length === 0) {
+        return;
+      }
+
+      const issuerEndpoints = [
+        this.options.loginEndpoint ?? 'https://login.microsoftonline.com',
+        'https://sts.windows.net',
+      ];
+      if (!allowedTenantIds.some((tenantId) => issuerEndpoints.some((endpoint) => iss.startsWith(`${endpoint}/${tenantId}/`)))) {
         throw new Error(`Token issuer '${iss}' not in allowed tenant IDs: ${allowedTenantIds.join(', ')}`);
       }
     }
@@ -211,8 +237,8 @@ export class JwtValidator {
   private validateScope(scp: string | undefined, overrideValidateScope?: { requiredScope: string }): void {
     const validateScope = overrideValidateScope || this.options.validateScope;
     if (validateScope) {
-      const scopes = scp ?? '';
-      if (!scopes.includes(validateScope.requiredScope)) {
+      const scopeSet = new Set((scp ?? '').split(' '));
+      if (!scopeSet.has(validateScope.requiredScope)) {
         throw new Error(`Token missing required scope: ${validateScope.requiredScope}`);
       }
     }
@@ -251,12 +277,16 @@ export const createEntraTokenValidator = (
   options?: {
     allowedTenantIds?: string[];
     requiredScope?: string;
+    applicationIdUri?: string;
+    loginEndpoint?: string;
     logger?: ILogger
   },
 ) => {
   return new JwtValidator({
     clientId,
     tenantId,
+    loginEndpoint: options?.loginEndpoint,
+    audience: options?.applicationIdUri ? [options.applicationIdUri] : undefined,
     validateIssuer: {
       allowedTenantIds: options?.allowedTenantIds
     },
@@ -267,20 +297,3 @@ export const createEntraTokenValidator = (
   }, options?.logger);
 };
 
-export const createServiceTokenValidator = (
-  appId: string,
-  tenantId?: string,
-  serviceUrl?: string,
-  logger?: ILogger
-) => {
-  return new JwtValidator({
-    clientId: appId,
-    tenantId,
-    validateIssuer: { allowedIssuer: 'https://api.botframework.com' },
-    validateServiceUrl: serviceUrl ? { expectedServiceUrl: serviceUrl } : undefined,
-    jwksUriOptions: {
-      type: 'uri',
-      uri: 'https://login.botframework.com/v1/.well-known/keys'
-    },
-  }, logger);
-};

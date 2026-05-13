@@ -1,10 +1,10 @@
 {
   "name": "@microsoft/teams.ts",
-  "version": "2.0.5",
+  "version": "0.0.0",
   "private": true,
   "homepage": "https://github.com/microsoft/teams.ts",
   "bugs": "https://github.com/microsoft/teams.ts/issues",
-  "packageManager": "npm@10.8.1",
+  "packageManager": "npm@11.12.1",
   "engines": {
     "node": ">=20"
   },
@@ -28,9 +28,12 @@
     "bots"
   ],
   "scripts": {
+    "version:stamp": "node scripts/version.js",
+    "version:get": "nbgv get-version -v NpmPackageVersion",
     "clean": "npx turbo clean",
     "build": "npx turbo build",
     "build:packages": "npx turbo build --filter=./packages/*",
+    "build:essential": "npx turbo build --filter='./packages/*' --filter='!./packages/graph' --filter='!./packages/graph-endpoints' --filter='!./packages/graph-endpoints-beta' --filter='!./packages/graph-tools' --filter='!./external/*'",
     "build:examples": "npx turbo build --filter=./examples/*",
     "build:external": "npx turbo build --filter=./external/*",
     "dev": "npx turbo dev",
@@ -39,9 +42,22 @@
     "test": "npx turbo test --concurrency=100%"
   },
   "devDependencies": {
-    "@changesets/cli": "latest",
     "@turbo/gen": "^2.5.7",
+    "nerdbank-gitversioning": "^3.9.50",
     "turbo": "^2.4.0",
     "typescript": "^5.4.5"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "4.40.1"
+  },
+  "overrides": {
+    "restify": {
+      "send": "^1.2.0",
+      "find-my-way": "^9.0.0"
+    },
+    "follow-redirects": "^1.16.0",
+    "router": {
+      "path-to-regexp": "^8.4.0"
+    }
   }
 }

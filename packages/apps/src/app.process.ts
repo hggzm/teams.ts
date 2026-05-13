@@ -1,22 +1,28 @@
-import { ActivityLike, ConversationReference, InvokeResponse, isInvokeResponse } from '@microsoft/teams.api';
+import { Activity, ActivityLike, ConversationReference, InvokeResponse, isInvokeResponse } from '@microsoft/teams.api';
 
 import { ApiClient, GraphClient } from './api';
 import { App } from './app';
 import { ActivityContext, IActivityContext } from './contexts';
 import { IActivityEvent } from './events';
-import { IPlugin, ISender } from './types';
+import { IPlugin, StreamCancelledError } from './types';
 
 /**
  * activity handler called when an inbound activity is received
- * @param sender the plugin to use for sending activities
  * @param event the received activity event
  */
 export async function $process<TPlugin extends IPlugin>(
   this: App<TPlugin>,
-  sender: ISender,
   event: IActivityEvent
 ): Promise<InvokeResponse> {
-  const { token, activity } = event;
+  const { token, body } = event;
+
+  if (!body) {
+    throw new Error('Activity body is required');
+  }
+
+  // TODO: We currently simply cast the models to Activity,
+  // but we should probably be validating this conversion
+  const activity = body as Activity;
 
   this.log.debug(
     `activity/${activity.type}${activity.type === 'invoke' ? `/${activity.name}` : ''}`
@@ -39,10 +45,12 @@ export async function $process<TPlugin extends IPlugin>(
   const client = this.client.clone();
   const apiClient = new ApiClient(serviceUrl, this.client.clone({ token: () => this.getBotToken() }), this.options.apiClientSettings);
   const userGraph = new GraphClient(
-    client.clone({ token: () => userToken })
+    client.clone({ token: () => userToken }),
+    { baseUrlRoot: this.graphBaseUrl }
   );
   const appGraph = new GraphClient(
-    client.clone({ token: () => this.getAppGraphToken(activity.conversation.tenantId ?? 'common') })
+    client.clone({ token: () => this.getAppGraphToken(activity.conversation.tenantId ?? 'common') }),
+    { baseUrlRoot: this.graphBaseUrl }
   );
 
   const ref: ConversationReference = {
@@ -65,7 +73,6 @@ export async function $process<TPlugin extends IPlugin>(
     if (plugin.onActivity) {
       const additionalPluginContext = await plugin.onActivity({
         ...ref,
-        sender: sender,
         activity,
         token,
       });
@@ -104,8 +111,8 @@ export async function $process<TPlugin extends IPlugin>(
     return data;
   };
 
-  const context = new ActivityContext(sender, {
-    ...event,
+  const context = new ActivityContext({
+    activity,
     next,
     api: apiClient,
     userGraph,
@@ -117,15 +124,16 @@ export async function $process<TPlugin extends IPlugin>(
     storage: this.storage,
     isSignedIn: !!userToken,
     connectionName: this.oauth.defaultConnectionName,
+    activitySender: this.activitySender,
+    ...pluginContexts
   });
 
   const send = context.send.bind(context);
   context.send = async (activity: ActivityLike, conversationRef?: ConversationReference) => {
-    const res = await send(activity, conversationRef);
+    const res = await send(activity, conversationRef ?? ref);
 
-    this.onActivitySent(sender, {
+    this.onActivitySent({
       ...(conversationRef ?? ref),
-      sender,
       activity: res,
     });
 
@@ -133,17 +141,15 @@ export async function $process<TPlugin extends IPlugin>(
   };
 
   context.stream.events.on('chunk', (activity) => {
-    this.onActivitySent(sender, {
+    this.onActivitySent({
       ...ref,
-      sender,
       activity,
     });
   });
 
   context.stream.events.once('close', (activity) => {
-    this.onActivitySent(sender, {
+    this.onActivitySent({
       ...ref,
-      sender,
       activity,
     });
   });
@@ -160,18 +166,23 @@ export async function $process<TPlugin extends IPlugin>(
       response = { status: 200, body: res };
     }
 
-    this.onActivityResponse(sender, {
+    this.onActivityResponse({
       ...ref,
-      sender,
       activity,
       response: res,
     });
   } catch (error: any) {
-    response = { status: 500 };
-    this.onError({ error, activity, sender });
-    this.onActivityResponse(sender, {
+    if (error instanceof StreamCancelledError || error?.name === 'StreamCancelledError') {
+      this.log.debug('stream canceled, returning 200');
+      await context.stream.close();
+      response = { status: 200 };
+    } else {
+      response = { status: 500 };
+      this.onError({ error, activity });
+    }
+
+    this.onActivityResponse({
       ...ref,
-      sender,
       activity,
       response: response,
     });

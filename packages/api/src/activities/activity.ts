@@ -69,6 +69,7 @@ export interface IActivity<T extends string = string> {
 
   /**
    * A reference to another conversation or activity.
+   * @deprecated This will be removed by end of summer 2026.
    */
   relatesTo?: ConversationReference;
 
@@ -172,6 +173,7 @@ export class Activity<T extends string = string> implements IActivity<T> {
 
   /**
    * A reference to another conversation or activity.
+   * @deprecated This will be removed by end of summer 2026.
    */
   relatesTo?: ConversationReference;
 
@@ -257,11 +259,6 @@ export class Activity<T extends string = string> implements IActivity<T> {
     return this;
   }
 
-  withReplyToId(value: string) {
-    this.replyToId = value;
-    return this;
-  }
-
   withChannelId(value: ChannelID) {
     this.channelId = value;
     return this;
@@ -277,13 +274,26 @@ export class Activity<T extends string = string> implements IActivity<T> {
     return this;
   }
 
+  /**
+   * @deprecated This will be removed by end of summer 2026.
+   */
   withRelatesTo(value: ConversationReference) {
     this.relatesTo = value;
     return this;
   }
 
-  withRecipient(value: Account) {
-    this.recipient = value;
+  /**
+   * Set the recipient of this activity, optionally marking it as a targeted message.
+   * Targeted messages are ephemeral to the specified recipient in a shared conversation.
+   * @param value - The recipient account
+   * @param isTargeted - If true, marks this as a targeted message visible only to the recipient (default: false)
+   * @returns this instance for chaining
+   *
+   * @experimental This API is in preview and may change in the future.
+   * Diagnostic: ExperimentalTeamsTargeted
+   */
+  withRecipient(value: Account, isTargeted: boolean = false) {
+    this.recipient = { ...value, isTargeted: isTargeted ? true : undefined };
     return this;
   }
 
@@ -308,7 +318,16 @@ export class Activity<T extends string = string> implements IActivity<T> {
   }
 
   withChannelData(value: ChannelData) {
-    this.channelData = { ...this.channelData, ...value };
+    const merged: ChannelData = { ...this.channelData, ...value };
+
+    if (merged.feedbackLoop !== undefined) {
+      merged.feedbackLoopEnabled = undefined;
+    } else if (merged.feedbackLoopEnabled === true) {
+      merged.feedbackLoop = { type: 'default' };
+      merged.feedbackLoopEnabled = undefined;
+    }
+
+    this.channelData = merged;
     return this;
   }
 
@@ -354,14 +373,17 @@ export class Activity<T extends string = string> implements IActivity<T> {
   }
 
   /**
-   * Enable message feedback
+   * Enable message feedback.
+   * @param mode - `'default'` shows Teams' built-in thumbs up/down UI.
+   *               `'custom'` triggers a `message/fetchTask` invoke so the bot can return its own task module dialog.
    */
-  addFeedback() {
+  addFeedback(mode: 'default' | 'custom' = 'default') {
     if (!this.channelData) {
       this.channelData = {};
     }
 
-    this.channelData.feedbackLoopEnabled = true;
+    this.channelData.feedbackLoop = { type: mode };
+    this.channelData.feedbackLoopEnabled = undefined;
     return this;
   }
 
@@ -396,6 +418,41 @@ export class Activity<T extends string = string> implements IActivity<T> {
     });
 
     return this;
+  }
+
+  /**
+   * Add a targeted message info entity for prompt preview.
+   * Skips if already present. In reactive flows, `ctx.send()` and `ctx.reply()`
+   * populate this automatically — use this helper for proactive or deferred sends.
+   * An invalid or expired messageId causes APX to silently drop the preview
+   * while still delivering the message.
+   *
+   * @param messageId the message ID of the targeted message (from the incoming activity's `id`)
+   *
+   * @experimental This API is in preview and may change in the future.
+   * Diagnostic: ExperimentalTeamsTargeted
+   */
+  addTargetedMessageInfo(messageId: string) {
+    if (this.entities) {
+      this.entities = this.entities.filter((e) => e.type !== 'quotedReply');
+    }
+
+    if (this.type === 'message') {
+      const msg = this as unknown as { text?: string };
+
+      if (msg.text) {
+        msg.text = msg.text.replace(`<quoted messageId="${messageId}"/>`, '').trim();
+      }
+    }
+
+    if (this.entities?.some((e) => e.type === 'targetedMessageInfo')) {
+      return this;
+    }
+
+    return this.addEntity({
+      type: 'targetedMessageInfo',
+      messageId,
+    });
   }
 
   /**
